@@ -82,3 +82,38 @@ def test_select_option_by_text_exact():
     sel = FakeSelect("city", [("Пермь", "p"), ("Березники", "b")])
     assert asyncio.run(s._select_option_by_text(sel, "Пермь"))
     assert sel.selected == "Пермь"
+
+
+class FakeAnchor:
+    def __init__(self, href):
+        self._href = href
+
+    async def get_attribute(self, name):
+        return self._href if name == "href" else None
+
+
+class FakePage:
+    def __init__(self, url, hrefs):
+        self.url = url
+        self._hrefs = hrefs
+
+    def locator(self, _sel):
+        return FakeList([FakeAnchor(h) for h in self._hrefs])
+
+
+def test_collect_precinct_urls_filters_and_absolutizes():
+    s = _scraper()
+    page = FakePage(
+        "https://sudrf.ru/index.php?id=300&act=go_ms_search",
+        [
+            "http://59.perm.msudrf.ru/",
+            "/index.php?id=300&page=2",
+            "http://1.perm.msudrf.ru/",
+            "javascript:void(0)",
+            "#ms",
+            "http://59.perm.msudrf.ru/",
+            "http://counter.sudrf.ru/cnt.php",
+        ],
+    )
+    urls = asyncio.run(s._collect_precinct_urls(page))
+    assert urls == ["http://59.perm.msudrf.ru/", "http://1.perm.msudrf.ru/"]

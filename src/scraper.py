@@ -1,11 +1,16 @@
 """Скрейпер ГАС «Правосудие» на Playwright (мировые судьи, поиск дел).
 
-Навигация и заполнение формы сделаны УСТОЙЧИВО к вёрстке:
-  * заходим на портал и, если нужно, переходим в раздел «Судебное делопроизводство»
-    по набору известных ссылок (а не по одному жёсткому селектору);
-  * форму ищем эвристически: по всем <form> на странице, поля сопоставляем по
-    подписям (label/текст опций) и по именам (article/region/city/date);
-  * заполняем найденные поля, отправляем ту форму, у которой есть «Найти».
+Схема работы:
+  1. Портал sudrf.ru → «Участки мировых судей» → в справочнике выбираем
+     субъект РФ (#ms_subj, напр. «Пермский край») → «Найти»;
+  2. Со страницы списка собираем ссылки на сайты судебных участков
+     (вида NN.perm.msudrf.ru);
+  3. По каждому участку открываем модуль судебного делопроизводства
+     (modules.php?name=sud_delo), заполняем период и собираем дела,
+     затем оставляем только подходящие по статьям КоАП.
+
+Поля формы и кнопки ищутся эвристически (по именам/подписям), ссылки на
+участки — по домену msudrf.ru. Это делает код устойчивым к смене вёрстки.
 
 Для диагностики (когда вёрстка изменилась) есть режим дампа:
 
@@ -109,6 +114,9 @@ class Scraper:
         date_from = today - timedelta(days=self.settings.lookback_days)
         return date_from.strftime("%d.%m.%Y")
 
+    def _date_window_to(self) -> str:
+        return datetime.now().strftime("%d.%m.%Y")
+
     # --------------------------------------------------------------- основной
     async def fetch_cases(
         self, articles: list[str] | None = None, dump: bool = False
@@ -129,18 +137,49 @@ class Scraper:
             page = await context.new_page()
             page.set_default_timeout(self.cfg.timeout_ms)
             try:
-                await self._open_search(page, dump)
-                await self._fill_and_submit(page, wanted, dump)
+                # 1) справочник участков → список участков региона
+                await self._open_precinct_list(page, dump)
+                precinct_urls = await self._collect_precinct_urls(page)
+                log.info("Найдено участков региона: %d", len(precinct_urls))
                 if dump:
-                    await self._dump(page, "after_submit")
-                for _ in range(self.cfg.max_pages):
-                    await self._check_captcha(page)
-                    html = await page.content()
-                    for case in parse_case_html(html, url=page.url):
-                        if not case.article or case.matches_articles(wanted):
-                            collected.setdefault(case.uid, case)
-                    if not await self._goto_next_page(page):
-                        break
+                    await self._dump(page, "05_precinct_urls")
+                if not precinct_urls:
+                    raise RuntimeError(
+                        "Не удалось получить список участков со страницы справочника. "
+                        "Пришлите logs/04_precinct_list_*.html — подстроим разбор ссылок."
+                    )
+
+                # 2) по каждому участку — форма делопроизводства и сбор дел
+                for idx, site_url in enumerate(precinct_urls, 1):
+                    log.info("[%d/%d] Участок: %s", idx, len(precinct_urls), site_url)
+                    try:
+                        ok = await self._open_case_search_on_site(page, site_url, dump)
+                    except CaptchaDetected:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        log.warning("Пропускаю участок %s (не открылся)", site_url)
+                        continue
+                    if not ok:
+                        log.warning("Не нашли форму дел на %s", site_url)
+                        if dump:
+                            await self._dump(page, f"no_form_{idx:02d}")
+                        continue
+                    try:
+                        await self._fill_and_submit(page, wanted, dump)
+                    except Exception:  # noqa: BLE001
+                        log.warning("Не удалось отправить форму на %s", site_url)
+                        continue
+                    if dump:
+                        await self._dump(page, f"after_submit_{idx:02d}")
+                    for _ in range(self.cfg.max_pages):
+                        await self._check_captcha(page)
+                        html = await page.content()
+                        for case in parse_case_html(html, url=page.url):
+                            if not case.article or case.matches_articles(wanted):
+                                collected.setdefault(case.uid, case)
+                        if not await self._goto_next_page(page):
+                            break
+                    self._pause()
             except CaptchaDetected:
                 raise
             except Exception:  # noqa: BLE001
@@ -154,53 +193,104 @@ class Scraper:
         return list(collected.values())
 
     # ---------------------------------------------------------- навигация
-    async def _open_search(self, page, dump: bool) -> None:
-        """Пройти до формы поиска дел у мировых судей.
+    async def _open_precinct_list(self, page, dump: bool) -> None:
+        """Открыть справочник участков и получить список участков региона.
 
-        Путь: главная → «Участки мировых судей» → регион «Пермский край» →
-        суд/участок → форма поиска (модуль судебного делопроизводства).
-        На каждом шаге при --dump сохраняются HTML и скриншот, чтобы было видно,
-        где именно остановились.
+        Путь: главная → «Участки мировых судей» → выбрать субъект РФ
+        (#ms_subj, Пермский край) → «Найти». Результат — страница списка
+        судебных участков выбранного региона.
         """
-        # 1) Открываем главную и переходим в «Участки мировых судей».
         await page.goto(HOME_URL, wait_until="domcontentloaded")
         if dump:
             await self._dump(page, "01_home")
 
         if not await self._click_link_texts(page, MIR_LINK_TEXTS):
-            # запасной путь — прямой адрес раздела
             log.info("Ссылка «Участки мировых судей» не найдена, открываем %s", MIR_ENTRY_URL)
             await page.goto(MIR_ENTRY_URL, wait_until="domcontentloaded")
         if dump:
             await self._dump(page, "02_mir_regions")
 
-        # 2) Выбираем регион (по ссылке или в выпадающем списке).
-        self._pause()
-        await self._choose_region(page, self.settings.region)
+        # Форма справочника участков: #ms_court_search, submit value="Найти".
+        try:
+            await page.locator("#ms_subj").select_option(label=self.settings.region)
+        except Exception:  # noqa: BLE001
+            # запасной путь — выбрать опцию по тексту
+            sel = page.locator("#ms_subj")
+            if await sel.count() == 0:
+                raise RuntimeError(
+                    "Не нашли форму справочника участков (#ms_court_search / #ms_subj). "
+                    "Пришлите logs/02_mir_regions_*.html — подстроим селекторы."
+                ) from None
+            await self._select_option_by_hint(sel.first, ("пермск",))
+        # убеждаемся, что выбран тип «участок мирового судьи»
+        try:
+            await page.locator("#msSearchType-ms").check()
+        except Exception:  # noqa: BLE001
+            pass
         if dump:
-            await self._dump(page, "03_perm_region")
+            await self._dump(page, "03_perm_selected")
 
-        # 3) Переходим к судебному делопроизводству выбранного суда/участка.
         self._pause()
-        await self._open_case_search_from_region(page)
+        submit = page.locator('#ms_court_search input[type="submit"]').first
+        if await submit.count() == 0:
+            submit = page.get_by_role("button", name="Найти").first
+        await submit.click()
+        await page.wait_for_load_state("domcontentloaded")
         if dump:
-            await self._dump(page, "04_case_search")
+            await self._dump(page, "04_precinct_list")
 
-        # 4) Если форма уже есть — готово; иначе последняя попытка найти ссылку.
-        if await self._page_has_form(page):
-            return
-        if await self._click_link_texts(page, ("судебное делопроизводство", "поиск дел")):
-            if dump:
-                await self._dump(page, "05_search_form")
+    async def _collect_precinct_urls(self, page) -> list[str]:
+        """Собрать абсолютные ссылки на сайты участков со страницы списка."""
+        from urllib.parse import urljoin
+
+        urls: list[str] = []
+        seen: set[str] = set()
+        try:
+            anchors = await page.locator("a[href]").all()
+        except Exception:  # noqa: BLE001
+            return urls
+        for a in anchors:
+            try:
+                href = await a.get_attribute("href") or ""
+            except Exception:  # noqa: BLE001
+                continue
+            if not href or href.startswith("#") or href.lower().startswith("javascript"):
+                continue
+            absolute = urljoin(page.url, href)
+            # интересуют только сайты участков (msudrf.ru / sudrf-домены)
+            if "msudrf.ru" not in absolute and "sudrf.ru" not in absolute:
+                continue
+            if any(k in absolute for k in ("index.php", "counter", "yandex", "/themes/")):
+                continue
+            if absolute in seen:
+                continue
+            seen.add(absolute)
+            urls.append(absolute)
+        return urls
+
+    async def _open_case_search_on_site(self, page, site_url: str, dump: bool) -> bool:
+        """На сайте участка открыть модуль судебного делопроизводства."""
+        from urllib.parse import urljoin
+
+        await page.goto(site_url, wait_until="domcontentloaded")
+        # типовые прямые адреса поиска дел в модуле sud_delo
+        for query in (
+            "modules.php?name=sud_delo&srv_num=1&name_op=sf",
+            "modules.php?name=sud_delo",
+        ):
+            search_url = urljoin(site_url, query)
+            try:
+                await page.goto(search_url, wait_until="domcontentloaded")
+            except Exception:  # noqa: BLE001
+                continue
             if await self._page_has_form(page):
-                return
-
+                return True
+        # иначе — ищем ссылку «Судебное делопроизводство» в меню сайта
+        if await self._click_link_texts(page, ("судебное делопроизводство", "поиск дел")):
+            return await self._page_has_form(page)
         if dump:
-            await self._dump(page, "no_form")
-        raise RuntimeError(
-            "Не нашли форму поиска дел у мировых судей. "
-            "Пришлите файлы из logs/ (0*.html) — подстроим навигацию под текущую вёрстку."
-        )
+            await self._dump(page, "site_no_form")
+        return False
 
     async def _page_has_form(self, page) -> bool:
         try:
@@ -225,46 +315,6 @@ class Scraper:
                 continue
         return False
 
-    async def _choose_region(self, page, region: str) -> None:
-        """Выбрать регион «Пермский край» на странице списка субъектов."""
-        # вариант A: ссылка с названием региона
-        if await self._click_link_texts(page, (region.lower(), "пермск")):
-            return
-        # вариант B: выпадающий список субъектов
-        for select in await page.locator("select").all():
-            if await self._select_option_by_hint(select, ("пермск",)):
-                try:
-                    await select.evaluate(
-                        "el => el.form && el.form.submit ? el.form.submit() : null"
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    await page.wait_for_load_state("domcontentloaded")
-                except Exception:  # noqa: BLE001
-                    pass
-                return
-        log.warning("Не удалось выбрать регион '%s'", region)
-
-    async def _open_case_search_from_region(self, page) -> None:
-        """На странице региона/суда перейти к судебному делопроизводству."""
-        # 1) сразу ссылка «Судебное делопроизводство»
-        if await self._click_link_texts(page, ("судебное делопроизводство", "поиск дел")):
-            return
-        # 2) иначе — первый суд/участок в списке, затем поиск
-        try:
-            court_link = page.locator(
-                "a[href*='sud_delo'], a[href*='srv_num'], a[href*='court'], "
-                "table a"
-            ).first
-            if await court_link.count() > 0:
-                self._pause()
-                await court_link.click()
-                await page.wait_for_load_state("domcontentloaded")
-                await self._click_link_texts(page, ("судебное делопроизводство", "поиск дел"))
-        except Exception:  # noqa: BLE001
-            log.warning("Не удалось открыть страницу суда/участка")
-
     # ------------------------------------------------------- форма поиска
     async def _fill_and_submit(self, page, articles: list[str], dump: bool) -> None:
         """Эвристически заполнить поля поиска и отправить форму."""
@@ -274,6 +324,7 @@ class Scraper:
             "city": self.settings.city,
             "court": self.settings.court_type,
             "date_from": self._date_window(),
+            "date_to": self._date_window_to(),
         }
 
         filled_any = False
@@ -310,6 +361,13 @@ class Scraper:
                     await inp.fill(values["date_from"])
                     filled_any = True
                     log.info("Заполнена дата с: %s", values["date_from"])
+                except Exception:  # noqa: BLE001
+                    pass
+            elif key == "date_to" and values["date_to"]:
+                try:
+                    await inp.fill(values["date_to"])
+                    filled_any = True
+                    log.info("Заполнена дата по: %s", values["date_to"])
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -392,6 +450,8 @@ class Scraper:
         if any(k in haystack for k in ("article", "koap", "стать")):
             return "article"
         if any(k in haystack for k in ("date", "дат")):
+            if any(k in haystack for k in ("_to", "to_", "по", "кон", "end", "до")):
+                return "date_to"
             return "date_from"
         return None
 
