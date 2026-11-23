@@ -167,7 +167,12 @@ class App(tk.Tk):
     def _show_error(self, message: str) -> None:
         self.search_btn.configure(state="normal")
         self.status_var.set("Ошибка поиска.")
-        messagebox.showerror("Ошибка", message)
+        hint = (
+            "\n\nЕсли сайт изменился, запустите в терминале:\n"
+            "    python -m src.scraper --dump --headful\n"
+            "и пришлите файл из папки logs/ — подстроим под текущую вёрстку."
+        )
+        messagebox.showerror("Ошибка", message + hint)
 
     # ------------------------------------------------------------ открытие
     def _on_open_selected(self, _event=None) -> None:
