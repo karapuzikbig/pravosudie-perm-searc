@@ -407,77 +407,119 @@ class Scraper:
 
     # ------------------------------------------------------- форма поиска
     async def _fill_and_submit(self, page, articles: list[str], dump: bool) -> None:
-        """Эвристически заполнить поля поиска и отправить форму."""
-        values = {
-            "article": articles[0],
-            "region": self.settings.region,
-            "city": self.settings.city,
-            "court": self.settings.court_type,
-            "date_from": self._date_window(),
-            "date_to": self._date_window_to(),
-        }
+        """Заполнить форму делопроизводства участка (вкладка КоАП) и искать.
 
-        filled_any = False
-        # SELECT-поля: выбираем нужную опцию по тексту
-        for select in await page.locator("select").all():
-            key = await self._select_key(select)
-            if not key:
-                continue
-            hint = OPTION_HINTS.get(key)
-            if hint and await self._select_option_by_hint(select, hint):
-                filled_any = True
-                log.info("Выбрано поле '%s' = %s", key, hint)
-            elif key in ("region", "city", "court"):
-                target = values.get(key, "")
-                if target and await self._select_option_by_text(select, target):
-                    filled_any = True
-                    log.info("Выбрано поле '%s' = %s", key, target)
+        Реальная вёрстка /modules.php?name=sud_delo&op=hl:
+          * вкладки типов дел (.bookmarks li#type_2 — «Дела об
+            административных правонарушениях»), контент в #bookmark_type_2;
+          * поля: ``adm_case__CASE_NUMBERSS``, ``ADM_PARTS__LAW_ARTICLE``
+            (главная статья КоАП), даты ``adm_case__RESULT_DATE1D/2D``;
+          * кнопка «Искать» внутри #button_block, результат в #search_results.
+        Статья — это autocomplete-поле .select-values; проще всего ввести текст
+        статьи и подтвердить значение.
+        """
+        await self._open_admin_tab(page)
 
-        # INPUT-поля: статья и дата
-        for inp in await page.locator("input").all():
-            itype = (await inp.get_attribute("type") or "text").lower()
-            if itype in ("submit", "button", "hidden", "checkbox", "radio", "file", "image"):
-                continue
-            key = await self._input_key(inp)
-            if key == "article" and values["article"]:
-                try:
-                    await inp.fill(values["article"])
-                    filled_any = True
-                    log.info("Заполнена статья: %s", values["article"])
-                except Exception:  # noqa: BLE001
-                    pass
-            elif key == "date_from" and values["date_from"]:
-                try:
-                    await inp.fill(values["date_from"])
-                    filled_any = True
-                    log.info("Заполнена дата с: %s", values["date_from"])
-                except Exception:  # noqa: BLE001
-                    pass
-            elif key == "date_to" and values["date_to"]:
-                try:
-                    await inp.fill(values["date_to"])
-                    filled_any = True
-                    log.info("Заполнена дата по: %s", values["date_to"])
-                except Exception:  # noqa: BLE001
-                    pass
+        date_from = self._date_window()
+        date_to = self._date_window_to()
+
+        filled_article = False
+        for art in articles:
+            if await self._fill_admin_article(page, art):
+                filled_article = True
+                log.info("Заполнена статья КоАП: %s", art)
+                break
+        if not filled_article:
+            log.warning("Не удалось заполнить статью КоАП в форме участка")
+
+        await self._fill_date(page, "adm_case__RESULT_DATE1D", date_from)
+        await self._fill_date(page, "adm_case__RESULT_DATE2D", date_to)
 
         if dump:
             await self._dump(page, "filled")
 
-        submit = await self._find_submit(page)
+        submit = page.locator("#button_block input.search").first
+        if await submit.count() == 0:
+            submit = await self._find_submit(page)
         if submit is None:
             raise RuntimeError(
-                "Не нашли кнопку «Найти» в форме поиска. "
+                "Не нашли кнопку «Искать» в форме дел участка. "
                 "Запустите 'python -m src.scraper --dump --headful' и пришлите logs/."
             )
-        if not filled_any:
-            log.warning("Не удалось распознать поля формы — отправляем как есть")
         self._pause()
         try:
             await submit.click()
         except Exception:  # noqa: BLE001
             await submit.press("Enter")
-        await page.wait_for_load_state("domcontentloaded")
+        # результат подгружается AJAX-ом в #search_results
+        await self._wait_search_results(page)
+
+    async def _open_admin_tab(self, page) -> None:
+        """Переключиться на вкладку «Дела об административных правонарушениях»."""
+        tab = page.locator("#bookmark_type_2, li#type_2").first
+        try:
+            if await tab.count() > 0:
+                self._pause()
+                await tab.click()
+                await asyncio.sleep(0.3)
+                log.info("Открыта вкладка административных дел")
+        except Exception:  # noqa: BLE001
+            log.warning("Не удалось переключить вкладку административных дел")
+
+    async def _fill_admin_article(self, page, article: str) -> bool:
+        """Ввести статью КоАП в поле «Главная статья (КоАП, ТК)»."""
+        selector = '#bookmark_type_2 input[name="ADM_PARTS__LAW_ARTICLE"]'
+        inp = page.locator(selector).first
+        if await inp.count() == 0:
+            # запасной поиск по имени на всей странице
+            inp = page.locator('input[name="ADM_PARTS__LAW_ARTICLE"]').first
+            if await inp.count() == 0:
+                return False
+        try:
+            await inp.click()
+            await inp.fill("")
+            await inp.type(article, delay=50)
+            await asyncio.sleep(0.5)
+            # autocomplete: подтверждаем первое совпадение, если есть список
+            try:
+                await inp.press("ArrowDown")
+                await inp.press("Enter")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _fill_date(self, page, name: str, value: str) -> None:
+        if not value:
+            return
+        try:
+            inp = page.locator(f'input[name="{name}"]').first
+            if await inp.count() > 0:
+                await inp.fill(value)
+                log.info("Заполнено поле %s = %s", name, value)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _wait_search_results(self, page) -> None:
+        """Дождаться, пока AJAX обновит блок результатов поиска."""
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const r = document.querySelector('#search_results');
+                    if (!r) return true;
+                    return r.querySelector('table') || r.querySelector('a[href]')
+                        || /не\\s+назначено|не\\s+найден/i.test(r.textContent || '');
+                }""",
+                timeout=self.cfg.timeout_ms,
+            )
+        except Exception:  # noqa: BLE001
+            # не критично: разберём текущий DOM как есть
+            await asyncio.sleep(1.0)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _select_key(self, select) -> str | None:
         """Определить назначение <select> по подписи/опциям/имени."""
@@ -528,22 +570,6 @@ class Scraper:
             pass
         t = target.lower()
         return await self._select_option_by_hint(select, (t,))
-
-    async def _input_key(self, inp) -> str | None:
-        try:
-            name = (await inp.get_attribute("name") or "").lower()
-            ident = (await inp.get_attribute("id") or "").lower()
-            placeholder = (await inp.get_attribute("placeholder") or "").lower()
-        except Exception:  # noqa: BLE001
-            return None
-        haystack = f"{name} {ident} {placeholder}"
-        if any(k in haystack for k in ("article", "koap", "стать")):
-            return "article"
-        if any(k in haystack for k in ("date", "дат")):
-            if any(k in haystack for k in ("_to", "to_", "по", "кон", "end", "до")):
-                return "date_to"
-            return "date_from"
-        return None
 
     async def _find_submit(self, page):
         for sel in (
