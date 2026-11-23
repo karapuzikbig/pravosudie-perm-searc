@@ -254,7 +254,7 @@ class Scraper:
 
     async def _collect_precinct_urls(self, page) -> list[str]:
         """Собрать абсолютные ссылки на сайты участков со страницы списка."""
-        from urllib.parse import urljoin
+        from urllib.parse import urljoin, urlparse
 
         urls: list[str] = []
         seen: set[str] = set()
@@ -270,8 +270,9 @@ class Scraper:
             if not href or href.startswith("#") or href.lower().startswith("javascript"):
                 continue
             absolute = urljoin(page.url, href)
-            # интересуют только сайты участков (msudrf.ru / sudrf-домены)
-            if "msudrf.ru" not in absolute and "sudrf.ru" not in absolute:
+            # интересуют только сайты участков вида NN.<region>.msudrf.ru
+            host = urlparse(absolute).hostname or ""
+            if not host.endswith(".msudrf.ru"):
                 continue
             if any(k in absolute for k in ("index.php", "counter", "yandex", "/themes/")):
                 continue

@@ -133,3 +133,17 @@ def test_is_blocked_detects_403():
     ok = FakeContentPage("<html><body>Список дел</body></html>")
     assert asyncio.run(s._is_blocked(blocked)) is True
     assert asyncio.run(s._is_blocked(ok)) is False
+
+
+def test_collect_precinct_urls_drops_portal_and_bare_msudrf():
+    s = _scraper()
+    page = FakePage(
+        "https://sudrf.ru/index.php?id=300&act=go_ms_search",
+        [
+            "https://sudrf.ru/",
+            "http://msudrf.ru/",
+            "http://5.perm.msudrf.ru/modules.php?name=sud_delo",
+        ],
+    )
+    urls = asyncio.run(s._collect_precinct_urls(page))
+    assert urls == ["http://5.perm.msudrf.ru/modules.php?name=sud_delo"]
