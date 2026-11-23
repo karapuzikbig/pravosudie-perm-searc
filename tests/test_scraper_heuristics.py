@@ -117,3 +117,19 @@ def test_collect_precinct_urls_filters_and_absolutizes():
     )
     urls = asyncio.run(s._collect_precinct_urls(page))
     assert urls == ["http://59.perm.msudrf.ru/", "http://1.perm.msudrf.ru/"]
+
+
+class FakeContentPage:
+    def __init__(self, html):
+        self._html = html
+
+    async def content(self):
+        return self._html
+
+
+def test_is_blocked_detects_403():
+    s = _scraper()
+    blocked = FakeContentPage("<html><body>403 Доступ запрещен</body></html>")
+    ok = FakeContentPage("<html><body>Список дел</body></html>")
+    assert asyncio.run(s._is_blocked(blocked)) is True
+    assert asyncio.run(s._is_blocked(ok)) is False

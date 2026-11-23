@@ -150,8 +150,11 @@ class Scraper:
                     )
 
                 # 2) по каждому участку — форма делопроизводства и сбор дел
+                blocked = 0
+                checked = 0
                 for idx, site_url in enumerate(precinct_urls, 1):
                     log.info("[%d/%d] Участок: %s", idx, len(precinct_urls), site_url)
+                    checked += 1
                     try:
                         ok = await self._open_case_search_on_site(page, site_url, dump)
                     except CaptchaDetected:
@@ -160,6 +163,8 @@ class Scraper:
                         log.warning("Пропускаю участок %s (не открылся)", site_url)
                         continue
                     if not ok:
+                        if await self._is_blocked(page):
+                            blocked += 1
                         log.warning("Не нашли форму дел на %s", site_url)
                         if dump:
                             await self._dump(page, f"no_form_{idx:02d}")
@@ -180,6 +185,12 @@ class Scraper:
                         if not await self._goto_next_page(page):
                             break
                     self._pause()
+                if checked and blocked >= checked:
+                    raise RuntimeError(
+                        "Все сайты участков ответили 403 «Доступ запрещен». "
+                        "Портал блокирует автоматические запросы с этого IP. "
+                        "Попробуйте позже, смените сеть/VPN или откройте сайт вручную в браузере."
+                    )
             except CaptchaDetected:
                 raise
             except Exception:  # noqa: BLE001
@@ -268,25 +279,49 @@ class Scraper:
             urls.append(absolute)
         return urls
 
+    async def _is_blocked(self, page) -> bool:
+        """Страница отдала 403/«Доступ запрещен» (антибот на сайтах участков)."""
+        try:
+            html = (await page.content()).lower()
+        except Exception:  # noqa: BLE001
+            return False
+        markers = ("доступ запрещен", "доступ запрещён", "403 forbidden", "error 403")
+        return any(m in html for m in markers)
+
+    async def _open_site_with_retry(self, page, site_url: str, dump: bool) -> bool:
+        """Открыть главную сайта участка, при блокировке — пауза и повтор."""
+        for attempt in (1, 2):
+            try:
+                await page.goto(site_url, wait_until="domcontentloaded")
+            except Exception:  # noqa: BLE001
+                log.warning("Не открылся %s (попытка %d)", site_url, attempt)
+                self._pause()
+                continue
+            if not await self._is_blocked(page):
+                return True
+            log.warning("403 на %s (попытка %d)", site_url, attempt)
+            if dump and attempt == 1:
+                await self._dump(page, "blocked_site")
+            self._pause()
+        return False
+
     async def _open_case_search_on_site(self, page, site_url: str, dump: bool) -> bool:
         """На сайте участка открыть модуль судебного делопроизводства."""
-        from urllib.parse import urljoin
-
-        await page.goto(site_url, wait_until="domcontentloaded")
-        # типовые прямые адреса поиска дел в модуле sud_delo
-        for query in (
-            "modules.php?name=sud_delo&srv_num=1&name_op=sf",
-            "modules.php?name=sud_delo",
+        if not await self._open_site_with_retry(page, site_url, dump):
+            if dump:
+                await self._dump(page, "site_no_form")
+            return False
+        # главная открылась — ищем форму прямо на ней, затем по ссылке меню
+        if await self._page_has_form(page):
+            return True
+        if await self._click_link_texts(
+            page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
         ):
-            search_url = urljoin(site_url, query)
-            try:
-                await page.goto(search_url, wait_until="domcontentloaded")
-            except Exception:  # noqa: BLE001
-                continue
-            if await self._page_has_form(page):
-                return True
-        # иначе — ищем ссылку «Судебное делопроизводство» в меню сайта
-        if await self._click_link_texts(page, ("судебное делопроизводство", "поиск дел")):
+            if await self._is_blocked(page):
+                log.warning("403 после перехода в делопроизводство на %s", site_url)
+                if dump:
+                    await self._dump(page, "site_no_form")
+                return False
             return await self._page_has_form(page)
         if dump:
             await self._dump(page, "site_no_form")
