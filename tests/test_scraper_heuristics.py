@@ -168,3 +168,20 @@ def test_html_has_captcha_by_structure():
     assert _html_has_captcha(None) is False
     assert _html_has_captcha("") is False
 
+
+def test_vote_codes_picks_most_frequent_then_longest():
+    from src.scraper import _vote_codes
+
+    assert _vote_codes(["abcd", "abcf", "abcd"]) == "abcd"
+    assert _vote_codes(["abc", "ab", "abc"]) == "abc"
+    assert _vote_codes(["", None, "xy"]) == "xy"
+    assert _vote_codes([]) == ""
+
+
+def test_prepare_captcha_variants_degrades_on_bad_bytes():
+    from src.scraper import _prepare_captcha_variants
+
+    variants = _prepare_captcha_variants(b"not-an-image")
+    assert variants == [b"not-an-image"]
+
+

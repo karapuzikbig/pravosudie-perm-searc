@@ -92,6 +92,76 @@ def _html_has_captcha(html: str | None) -> bool:
     return "captcha.php" in low and "<img" in low
 
 
+def _prepare_captcha_variants(img_bytes: bytes) -> list[bytes]:
+    """Дать OCR несколько предобработанных вариантов картинки KCAPTCHA.
+
+    KCAPTCHA рисует символы с волнами, шумом и линиями. ddddocr на «сырой»
+    картинке читает плохо, поэтому готовим варианты: серый + бинаризация
+    (Оцу), инверсия, увеличение, фильтрация шума. OCR прогоняем по всем и
+    берём самый частый результат — так точность заметно выше.
+    """
+    try:
+        import cv2  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return [img_bytes]
+
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return [img_bytes]
+
+    variants: list[bytes] = []
+
+    def _encode(mat) -> bytes | None:
+        ok, buf = cv2.imencode(".png", mat)
+        return buf.tobytes() if ok else None
+
+    # 1) апскейл x2 + серый
+    up = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+
+    # 2) бинаризация Оцу (тёмные символы на светлом)
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # лёгкое размытие убирает точки-шум, оставляя штрихи
+    otsu_clean = cv2.medianBlur(otsu, 3)
+
+    # 3) инверсия Оцу (на случай светлых символов)
+    inv = cv2.bitwise_not(otsu_clean)
+
+    # 4) адаптивная бинаризация (устойчива к градиенту фона)
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
+    )
+
+    # 5) просто увеличенное серое
+    for mat in (gray, otsu, otsu_clean, inv, adaptive):
+        enc = _encode(mat)
+        if enc:
+            variants.append(enc)
+    return variants or [img_bytes]
+
+
+def _vote_codes(codes: list[str]) -> str:
+    """Выбрать самый частый код среди прочтений (по среднему при равенстве).
+
+    Несколько предобработанных вариантов и повторные прогоны дают набор
+    гипотез. Берём самый частый; при равенстве — самый длинный (KCAPTCHA
+    обычно 5–6 символов, обрезанное чтение короче).
+    """
+    from collections import Counter  # noqa: PLC0415
+
+    cleaned = [_clean_ocr_code(c) for c in codes]
+    cleaned = [c for c in cleaned if c]
+    if not cleaned:
+        return ""
+    counts = Counter(cleaned)
+    best_count = max(counts.values())
+    candidates = [c for c, n in counts.items() if n == best_count]
+    candidates.sort(key=len, reverse=True)
+    return candidates[0]
+
+
 class Scraper:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -434,15 +504,28 @@ class Scraper:
                     return True
                 return False
             try:
-                img_bytes = await img_loc.screenshot()
+                img_bytes = await self._fetch_captcha_image(page, img_loc)
             except Exception:  # noqa: BLE001
                 return False
+            variants = _prepare_captcha_variants(img_bytes)
+            codes: list[str] = []
             try:
-                code = _clean_ocr_code(ocr.classification(img_bytes))
+                for var in variants:
+                    try:
+                        codes.append(_clean_ocr_code(ocr.classification(var)))
+                    except Exception:  # noqa: BLE001
+                        continue
+                code = _vote_codes(codes)
             except Exception as exc:  # noqa: BLE001
                 log.warning("OCR капчи упал: %s", exc)
                 return False
-            log.info("Капча, попытка %d/%d: распознано «%s»", attempt, attempts, code)
+            log.info(
+                "Капча, попытка %d/%d: варианты=%s → «%s»",
+                attempt,
+                attempts,
+                [c for c in (_clean_ocr_code(x) for x in codes) if c],
+                code,
+            )
             if not code:
                 await self._reload_captcha(page)
                 continue
@@ -463,6 +546,32 @@ class Scraper:
             log.info("Капча не принята (код «%s»), пробуем снова", code)
             self._pause()
         return False
+
+    async def _fetch_captcha_image(self, page, img_loc) -> bytes:
+        """Получить PNG/JPEG байты картинки капчи.
+
+        Предпочтительно скачать по src через контекст запросов браузера —
+        так не теряется резкость из-за масштабирования элемента. Если не
+        удалось — снимаем скриншот самого элемента.
+        """
+        src = None
+        try:
+            src = await img_loc.get_attribute("src")
+        except Exception:  # noqa: BLE001
+            src = None
+        if src:
+            try:
+                from urllib.parse import urljoin  # noqa: PLC0415
+
+                url = urljoin(page.url, src)
+                resp = await page.context.request.get(url)
+                if resp.ok:
+                    data = await resp.body()
+                    if data:
+                        return data
+            except Exception:  # noqa: BLE001
+                pass
+        return await img_loc.screenshot()
 
     async def _submit_captcha(self, page) -> None:
         form = page.locator("#kcaptchaForm").first
