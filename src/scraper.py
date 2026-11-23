@@ -29,14 +29,14 @@ from .parsers import Case, parse_case_html
 
 log = logging.getLogger(__name__)
 
-# Входные точки портала ГАС «Правосудие» (проверяются по очереди).
-ENTRY_URLS = [
-    "https://sudrf.ru/modules.php?name=sud_delo",
-    "https://sudrf.ru/",
-]
+# Входная точка — главная портал ГАС «Правосудие».
+HOME_URL = "https://sudrf.ru/"
 
-# Ссылки-переходы в раздел судебного делопроизводства.
-SEARCH_LINK_TEXTS = ("судебное делопроизводство", "поиск дел", "найти дело", "дела")
+# Прямой адрес раздела «Участки мировых судей» (со страницы главной).
+MIR_ENTRY_URL = "https://sudrf.ru/index.php?id=300&var=true"
+
+# Ссылки-переходы (по тексту ссылки), в порядке прохождения.
+MIR_LINK_TEXTS = ("участки мировых судей",)
 
 # Текстовые подсказки для полей формы (по подписи рядом / тексту опций).
 FIELD_HINTS = {
@@ -155,30 +155,51 @@ class Scraper:
 
     # ---------------------------------------------------------- навигация
     async def _open_search(self, page, dump: bool) -> None:
-        """Открыть портал и перейти в раздел судебного делопроизводства."""
-        last_error: Exception | None = None
-        for url in ENTRY_URLS:
-            try:
-                await page.goto(url, wait_until="domcontentloaded")
-                if dump:
-                    await self._dump(page, "entry")
-                if await self._page_has_form(page):
-                    log.info("Форма поиска уже на странице %s", url)
-                    return
-                if await self._click_search_link(page):
-                    log.info("Перешли в раздел делопроизводства")
-                    return
-                log.info("На %s формы/ссылки нет, пробуем следующий адрес", url)
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                log.warning("Не удалось открыть %s: %s", url, exc)
+        """Пройти до формы поиска дел у мировых судей.
+
+        Путь: главная → «Участки мировых судей» → регион «Пермский край» →
+        суд/участок → форма поиска (модуль судебного делопроизводства).
+        На каждом шаге при --dump сохраняются HTML и скриншот, чтобы было видно,
+        где именно остановились.
+        """
+        # 1) Открываем главную и переходим в «Участки мировых судей».
+        await page.goto(HOME_URL, wait_until="domcontentloaded")
+        if dump:
+            await self._dump(page, "01_home")
+
+        if not await self._click_link_texts(page, MIR_LINK_TEXTS):
+            # запасной путь — прямой адрес раздела
+            log.info("Ссылка «Участки мировых судей» не найдена, открываем %s", MIR_ENTRY_URL)
+            await page.goto(MIR_ENTRY_URL, wait_until="domcontentloaded")
+        if dump:
+            await self._dump(page, "02_mir_regions")
+
+        # 2) Выбираем регион (по ссылке или в выпадающем списке).
+        self._pause()
+        await self._choose_region(page, self.settings.region)
+        if dump:
+            await self._dump(page, "03_perm_region")
+
+        # 3) Переходим к судебному делопроизводству выбранного суда/участка.
+        self._pause()
+        await self._open_case_search_from_region(page)
+        if dump:
+            await self._dump(page, "04_case_search")
+
+        # 4) Если форма уже есть — готово; иначе последняя попытка найти ссылку.
+        if await self._page_has_form(page):
+            return
+        if await self._click_link_texts(page, ("судебное делопроизводство", "поиск дел")):
+            if dump:
+                await self._dump(page, "05_search_form")
+            if await self._page_has_form(page):
+                return
+
         if dump:
             await self._dump(page, "no_form")
-        if last_error:
-            raise RuntimeError(f"Не удалось открыть портал: {last_error}")
         raise RuntimeError(
-            "Не нашли форму поиска дел. Запустите 'python -m src.scraper --dump --headful' "
-            "и пришлите файл из logs/ — подстроим навигацию под текущую вёрстку."
+            "Не нашли форму поиска дел у мировых судей. "
+            "Пришлите файлы из logs/ (0*.html) — подстроим навигацию под текущую вёрстку."
         )
 
     async def _page_has_form(self, page) -> bool:
@@ -187,18 +208,62 @@ class Scraper:
         except Exception:  # noqa: BLE001
             return False
 
-    async def _click_search_link(self, page) -> bool:
-        for text in SEARCH_LINK_TEXTS:
+    async def _click_link_texts(self, page, texts: tuple[str, ...]) -> bool:
+        """Кликнуть по первой ссылке, текст которой содержит один из фрагментов."""
+        for text in texts:
             try:
-                link = page.get_by_role("link", name=text).first
+                link = page.get_by_role("link", name=text, exact=False).first
                 if await link.count() > 0:
                     self._pause()
-                    await link.click()
+                    try:
+                        await link.click()
+                    except Exception:  # noqa: BLE001
+                        await link.click(force=True)
                     await page.wait_for_load_state("domcontentloaded")
                     return True
             except Exception:  # noqa: BLE001
                 continue
         return False
+
+    async def _choose_region(self, page, region: str) -> None:
+        """Выбрать регион «Пермский край» на странице списка субъектов."""
+        # вариант A: ссылка с названием региона
+        if await self._click_link_texts(page, (region.lower(), "пермск")):
+            return
+        # вариант B: выпадающий список субъектов
+        for select in await page.locator("select").all():
+            if await self._select_option_by_hint(select, ("пермск",)):
+                try:
+                    await select.evaluate(
+                        "el => el.form && el.form.submit ? el.form.submit() : null"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await page.wait_for_load_state("domcontentloaded")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+        log.warning("Не удалось выбрать регион '%s'", region)
+
+    async def _open_case_search_from_region(self, page) -> None:
+        """На странице региона/суда перейти к судебному делопроизводству."""
+        # 1) сразу ссылка «Судебное делопроизводство»
+        if await self._click_link_texts(page, ("судебное делопроизводство", "поиск дел")):
+            return
+        # 2) иначе — первый суд/участок в списке, затем поиск
+        try:
+            court_link = page.locator(
+                "a[href*='sud_delo'], a[href*='srv_num'], a[href*='court'], "
+                "table a"
+            ).first
+            if await court_link.count() > 0:
+                self._pause()
+                await court_link.click()
+                await page.wait_for_load_state("domcontentloaded")
+                await self._click_link_texts(page, ("судебное делопроизводство", "поиск дел"))
+        except Exception:  # noqa: BLE001
+            log.warning("Не удалось открыть страницу суда/участка")
 
     # ------------------------------------------------------- форма поиска
     async def _fill_and_submit(self, page, articles: list[str], dump: bool) -> None:
