@@ -1,8 +1,9 @@
-"""Юнит-тесты хранилища: антидубли и смена даты заседания."""
+"""Юнит-тесты хранилища и разбора списка статей."""
 from __future__ import annotations
 
 from datetime import datetime
 
+from src.config import parse_articles
 from src.parsers import Case, Hearing
 from src.storage import Storage
 
@@ -30,9 +31,9 @@ def test_new_changed_same(tmp_path):
     assert st.count() == 1
 
 
-def test_settings_roundtrip(tmp_path):
-    st = Storage(tmp_path / "test.db")
-    assert st.get_setting("articles", ["x"]) == ["x"]
-    st.set_setting("articles", ["12.8", "20.20"])
-    assert st.get_setting("articles") == ["12.8", "20.20"]
-    assert st.get_setting("muted", False) is False
+def test_parse_articles_variants():
+    assert parse_articles("12.8, 20.20") == ["12.8", "20.20"]
+    assert parse_articles("12.8 20.20; 6.9") == ["12.8", "20.20", "6.9"]
+    assert parse_articles("12.8,\n20.20 ,") == ["12.8", "20.20"]
+    assert parse_articles("12.8, 12.8") == ["12.8"]
+    assert parse_articles("", fallback=["6.9"]) == ["6.9"]

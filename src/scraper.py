@@ -33,8 +33,6 @@ log = logging.getLogger(__name__)
 # Базовый адрес портала ГАС «Правосудие»
 BASE_URL = "https://sudrf.ru"
 
-# Портал мировых судей (подсистема ГАС «Правосудие»)
-
 # Стратегии поиска ссылки на раздел «Судебное делопроизводство».
 # Проверяются по очереди, пока одна не сработает.
 SELECTORS: dict[str, list[str]] = {
@@ -153,7 +151,9 @@ class Scraper:
         return date_from.strftime(fmt), date_to.strftime(fmt)
 
     # --------------------------------------------------------------- основной
-    async def fetch_cases(self) -> list[Case]:
+    async def fetch_cases(self, articles: list[str] | None = None) -> list[Case]:
+        """Собрать дела по указанным статьям (по умолчанию — из настроек)."""
+        wanted = articles or self.settings.default_articles
         from playwright.async_api import async_playwright
 
         collected: dict[str, Case] = {}
@@ -170,13 +170,13 @@ class Scraper:
             page.set_default_timeout(self.cfg.timeout_ms)
             try:
                 await self._open_search(page)
-                await self._fill_form(page)
+                await self._fill_form(page, wanted)
                 for _ in range(self.cfg.max_pages):
                     await self._check_captcha(page)
                     html = await page.content()
                     for case in parse_case_html(html, url=page.url):
-                        if case.matches_articles(self.settings.articles) or not case.article:
-                            collected[case.uid] = case
+                        if not case.article or case.matches_articles(wanted):
+                            collected.setdefault(case.uid, case)
                     nxt = await self._first(page, "next_page")
                     if not nxt:
                         break
@@ -212,7 +212,7 @@ class Scraper:
         except Exception:  # noqa: BLE001
             log.warning("Переход по ссылке делопроизводства не удался")
 
-    async def _fill_form(self, page) -> None:
+    async def _fill_form(self, page, articles: list[str]) -> None:
         # тип суда
         loc = await self._first(page, "court_type_select")
         if loc:
@@ -237,11 +237,12 @@ class Scraper:
             except Exception:  # noqa: BLE001
                 log.warning("Не удалось выбрать город '%s'", self.settings.city)
 
-        # статья (первая из списка — остальные фильтруем на нашей стороне)
+        # статья (первая из списка забивается в форму; остальные фильтруем
+        # по результатам на нашей стороне в fetch_cases)
         loc = await self._first(page, "article_input")
         if loc:
             try:
-                await loc.fill(self.settings.articles[0])
+                await loc.fill(articles[0])
             except Exception:  # noqa: BLE001
                 log.warning("Не удалось заполнить статью")
 
@@ -263,14 +264,14 @@ class Scraper:
         await page.wait_for_load_state("networkidle")
 
 
-async def _run_debug(headful: bool = False) -> int:
+async def _run_debug(headful: bool = False, articles: list[str] | None = None) -> int:
     from .config import load_settings
 
     settings = load_settings()
     settings.scraper.headless = not headful
     scraper = Scraper(settings)
     try:
-        cases = await scraper.fetch_cases()
+        cases = await scraper.fetch_cases(articles)
     except CaptchaDetected as exc:
         print(f"[!] {exc}")
         return 2
@@ -281,7 +282,7 @@ async def _run_debug(headful: bool = False) -> int:
         return 1
     print(f"Найдено дел: {len(cases)}")
     for c in cases:
-        print(f"  - {c.article} | {c.district} | {c.case_number} | {c.hearing.iso or c.hearing.raw}")
+        print(f"  - {c.article} | {c.district} | {c.case_number} | {c.hearing.iso or c.hearing.raw} | {c.url}")
     return 0
 
 
@@ -289,14 +290,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Отладочный запуск скрейпера ГАС «Правосудие»")
     parser.add_argument("--debug", action="store_true", help="подробные логи")
     parser.add_argument("--headful", action="store_true", help="показать окно браузера")
+    parser.add_argument("--articles", help="статьи через запятую, напр. '12.8,20.20'")
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    from .config import parse_articles
+
+    articles = parse_articles(args.articles) if args.articles else None
     import asyncio
 
-    return asyncio.run(_run_debug(headful=args.headful))
+    return asyncio.run(_run_debug(headful=args.headful, articles=articles))
 
 
 if __name__ == "__main__":

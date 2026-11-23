@@ -1,4 +1,8 @@
-"""Загрузка и валидация конфигурации (config.yaml + .env)."""
+"""Загрузка конфигурации приложения (config.yaml).
+
+Статьи КоАП задаются пользователем в окне программы, поэтому в конфиге
+они необязательны (служат значением по умолчанию для поля ввода).
+"""
 from __future__ import annotations
 
 import os
@@ -24,25 +28,34 @@ class ScraperConfig:
 
 @dataclass
 class Settings:
-    articles: list[str]
     region: str
     city: str
     court_type: str
+    default_articles: list[str] = field(default_factory=list)
     districts: list[str] = field(default_factory=list)
     lookback_days: int = 7
-    poll_interval_minutes: int = 60
-    notify_channel: str = "telegram"
-    notify_chat_id: int | None = None
     scraper: ScraperConfig = field(default_factory=ScraperConfig)
 
-    # из .env
-    tg_bot_token: str = ""
-    admin_chat_id: int | None = None
+    # из .env / окружения
     db_path: str = "data/pravosudie.db"
     log_level: str = "INFO"
 
-    def effective_chat_id(self) -> int | None:
-        return self.admin_chat_id or self.notify_chat_id
+    def effective_articles(self, raw: str | None = None) -> list[str]:
+        """Разобрать строку статей из поля ввода ('12.8, 20.20 6.9')."""
+        if raw is None:
+            return list(self.default_articles)
+        return parse_articles(raw, fallback=self.default_articles)
+
+
+def parse_articles(raw: str, fallback: list[str] | None = None) -> list[str]:
+    """Разобрать статьи, перечисленные через запятую/пробел/перенос строки."""
+    parts = [p for chunk in (raw or "").replace(";", ",").split(",") for p in chunk.split()]
+    result = []
+    for p in parts:
+        p = p.strip().strip(".,")
+        if p and p not in result:
+            result.append(p)
+    return result or list(fallback or [])
 
 
 def _as_int(value: Any) -> int | None:
@@ -58,12 +71,10 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
     load_dotenv(env_path or BASE_DIR / ".env")
 
     path = Path(config_path) if config_path else BASE_DIR / "config.yaml"
-    with open(path, encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh) or {}
-
-    articles = [str(a).strip() for a in (raw.get("articles") or []) if str(a).strip()]
-    if not articles:
-        raise ValueError("config.yaml: список 'articles' пуст — укажите хотя бы одну статью КоАП")
+    raw: dict[str, Any] = {}
+    if path.exists():
+        with open(path, encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh) or {}
 
     scraper_raw = raw.get("scraper") or {}
     scraper = ScraperConfig(
@@ -75,22 +86,16 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         screenshot_on_error=bool(scraper_raw.get("screenshot_on_error", True)),
     )
 
-    notify_raw = raw.get("notify") or {}
+    articles = [str(a).strip() for a in (raw.get("articles") or []) if str(a).strip()]
 
-    settings = Settings(
-        articles=articles,
+    return Settings(
         region=str(raw.get("region", "Пермский край")),
         city=str(raw.get("city", "Пермь")),
         court_type=str(raw.get("court_type", "Мировой судья")),
+        default_articles=articles,
         districts=[str(d) for d in (raw.get("districts") or [])],
         lookback_days=int(raw.get("lookback_days", 7)),
-        poll_interval_minutes=int(raw.get("poll_interval_minutes", 60)),
-        notify_channel=str(notify_raw.get("channel", "telegram")),
-        notify_chat_id=_as_int(notify_raw.get("chat_id")),
         scraper=scraper,
-        tg_bot_token=os.getenv("TG_BOT_TOKEN", "").strip(),
-        admin_chat_id=_as_int(os.getenv("ADMIN_CHAT_ID")),
         db_path=os.getenv("DB_PATH", "data/pravosudie.db"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
     )
-    return settings

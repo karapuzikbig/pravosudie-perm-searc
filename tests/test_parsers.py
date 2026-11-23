@@ -18,7 +18,7 @@ TABLE_HTML = """
 <table>
   <tr><th>Номер дела</th><th>Статья</th><th>Судебный участок</th><th>Дата заседания</th></tr>
   <tr>
-    <td>5-123/2025</td>
+    <td><a href="/modules.php?id=5-123/2025">5-123/2025</a></td>
     <td>12.8 ч.1 КоАП РФ</td>
     <td>Судебный участок №3</td>
     <td>12.03.2025 14:30</td>
@@ -36,7 +36,7 @@ TABLE_HTML = """
 BLOCK_HTML = """
 <html><body>
 <div class="case">
-  <a href="/case/1">Дело 5-77/2025</a>
+  <a href="https://sudrf.ru/case/1">Дело 5-77/2025</a>
   <span>Ст. 6.9 КоАП РФ</span>
   <span>Судебный участок №12</span>
   <span>Заседание 20.05.2025 11:15</span>
@@ -61,18 +61,20 @@ def test_extract_fields():
     assert extract_district(text) == "Судебный участок №5"
 
 
-def test_parse_table_html():
-    cases = parse_case_html(TABLE_HTML)
+def test_parse_table_html_with_links():
+    cases = parse_case_html(TABLE_HTML, url="https://sudrf.ru/search")
     assert len(cases) == 2
     first = cases[0]
     assert first.case_number == "5-123/2025"
     assert first.article == "12.8"
     assert first.district == "Судебный участок №3"
     assert first.hearing.iso == "2025-03-12 14:30"
+    # относительная ссылка из строки разрешена в абсолютную
+    assert first.url == "https://sudrf.ru/modules.php?id=5-123/2025"
 
 
-def test_parse_block_html():
-    cases = parse_case_html(BLOCK_HTML, url="https://sudrf.ru/case/1")
+def test_parse_block_html_absolute_link():
+    cases = parse_case_html(BLOCK_HTML)
     assert len(cases) == 1
     c = cases[0]
     assert c.case_number == "5-77/2025"

@@ -1,7 +1,7 @@
 services:
-  bot:
+  app:
     build: .
-    container_name: pravosudie-bot
+    container_name: pravosudie-gui
     restart: unless-stopped
     env_file:
       - .env

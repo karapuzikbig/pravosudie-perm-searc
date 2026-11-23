@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -20,11 +21,12 @@ TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})(?::\d{2})?\b")
 ARTICLE_RE = re.compile(r"\b(\d{1,2}\.\d{1,2}(?:\.\d{1,3})?)\s*(?:ч\.?\s*\d+)?\s*КоАП", re.IGNORECASE)
 CASE_NUMBER_RE = re.compile(r"\b\d+[-\u2013]\d+/\d{4}\b")
 DISTRICT_RE = re.compile(r"(судебн\w+\s+участ\w*)\s*№?\s*(\d+)", re.IGNORECASE)
+HEARING_HEADER_KEYS = ("заседани", "дата", "время", "назнач")
 
 
 @dataclass
 class Hearing:
-    """Одно судебное заседание (дата/время/место)."""
+    """Одно судебное заседание (дата/время)."""
 
     date: datetime | None = None
     raw: str = ""
@@ -101,6 +103,17 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def _row_link(row, base_url: str) -> str:
+    """Ссылка на карточку дела: предпочтительно из строки результата."""
+    a = row.find("a", href=True)
+    if not a:
+        return ""
+    href = (a["href"] or "").strip()
+    if not href or href.startswith(("javascript:", "#")):
+        return ""
+    return urljoin(base_url, href) if base_url else href
+
+
 def parse_case_html(html: str, url: str = "") -> list[Case]:
     """Разобрать страницу со списком/карточками дел.
 
@@ -120,8 +133,9 @@ def parse_case_html(html: str, url: str = "") -> list[Case]:
             cells = row.find_all("td")
             if not cells:
                 continue
-            row_text = _clean(" ".join(c.get_text(" ", strip=True) for c in cells))
-            case = _case_from_row(headers, [_clean(c.get_text(" ", strip=True)) for c in cells], row_text, url)
+            cell_texts = [_clean(c.get_text(" ", strip=True)) for c in cells]
+            row_text = _clean(" ".join(cell_texts))
+            case = _case_from_row(headers, cell_texts, row_text, _row_link(row, url) or url)
             if case:
                 cases.append(case)
         if cases:
@@ -135,8 +149,8 @@ def parse_case_html(html: str, url: str = "") -> list[Case]:
         # избегаем дублей от вложенных контейнеров
         if any(text in _clean(c.summary) for c in cases):
             continue
-        link = block.find("a", href=True)
-        case = _case_from_row([], [], text, url or (link["href"] if link else ""))
+        link = _row_link(block, url) or url
+        case = _case_from_row([], [], text, link)
         if case:
             cases.append(case)
     return cases
@@ -158,7 +172,7 @@ def _case_from_row(headers: list[str], cells: list[str], row_text: str, url: str
 
     hearing_raw = ""
     for h, v in field_map.items():
-        if any(k in h for k in ("заседани", "дата", "время", "назнач")):
+        if any(k in h for k in HEARING_HEADER_KEYS):
             hearing_raw = v or hearing_raw
     if not hearing_raw:
         hearing_raw = row_text
@@ -182,21 +196,3 @@ def _case_from_row(headers: list[str], cells: list[str], row_text: str, url: str
         url=url,
         summary=_clean(row_text)[:300],
     )
-
-
-def format_case(case: Case) -> str:
-    """Человекочитаемое представление дела для Telegram."""
-    lines = [f"⚖️ <b>Ст. {case.article} КоАП</b>"]
-    if case.district:
-        lines.append(f"Участок: {case.district}")
-    if case.court:
-        lines.append(f"Суд: {case.court}")
-    if case.case_number:
-        lines.append(f"Дело: <code>{case.case_number}</code>")
-    if case.hearing.iso:
-        lines.append(f"🗓 Заседание: <b>{case.hearing.iso}</b>")
-    elif case.hearing.raw:
-        lines.append(f"🗓 {case.hearing.raw}")
-    if case.url:
-        lines.append(f'<a href="{case.url}">Открыть карточку</a>')
-    return "\n".join(lines)

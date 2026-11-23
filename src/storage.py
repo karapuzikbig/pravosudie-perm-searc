@@ -1,7 +1,6 @@
-"""SQLite-хранилище: история дел, антидубли, подписки, настройки статей."""
+"""SQLite-хранилище найденных дел (история поиска для окна программы)."""
 from __future__ import annotations
 
-import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -22,16 +21,10 @@ CREATE TABLE IF NOT EXISTS cases (
     url           TEXT,
     summary       TEXT,
     first_seen    TEXT NOT NULL,
-    last_seen     TEXT NOT NULL,
-    notified_at   TEXT
+    last_seen     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cases_hearing ON cases(hearing_iso);
 CREATE INDEX IF NOT EXISTS idx_cases_article ON cases(article);
-
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
 """
 
 
@@ -52,20 +45,12 @@ class Storage:
         finally:
             conn.close()
 
-    # ------------------------------------------------------------------ дела
     def upsert_case(self, case: Case, now: datetime | None = None) -> str:
-        """Сохранить/обновить дело.
-
-        Возвращает статус:
-          "new"      — дело раньше не встречалось;
-          "changed"  — изменилась дата/время заседания (перенос);
-          "same"     — без изменений.
-        """
+        """Сохранить/обновить дело. Возвращает 'new' | 'changed' | 'same'."""
         now_iso = (now or datetime.now()).isoformat(timespec="seconds")
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT hearing_iso, hearing_raw, notified_at FROM cases WHERE uid = ?",
-                (case.uid,),
+                "SELECT hearing_iso FROM cases WHERE uid = ?", (case.uid,)
             ).fetchone()
             if row is None:
                 conn.execute(
@@ -81,26 +66,18 @@ class Storage:
                 return "new"
 
             old_iso = row["hearing_iso"]
-            new_iso = case.hearing.iso
             conn.execute(
                 """UPDATE cases SET case_number=?, article=?, court=?, district=?,
                        hearing_raw=?, hearing_iso=?, url=?, summary=?, last_seen=?
                    WHERE uid=?""",
                 (
                     case.case_number, case.article, case.court, case.district,
-                    case.hearing.raw, new_iso, case.url, case.summary, now_iso, case.uid,
+                    case.hearing.raw, case.hearing.iso, case.url, case.summary, now_iso, case.uid,
                 ),
             )
-            if new_iso and old_iso != new_iso:
+            if case.hearing.iso and old_iso != case.hearing.iso:
                 return "changed"
             return "same"
-
-    def mark_notified(self, uid: str, now: datetime | None = None) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE cases SET notified_at = ? WHERE uid = ?",
-                ((now or datetime.now()).isoformat(timespec="seconds"), uid),
-            )
 
     def all_cases(self) -> list[dict]:
         with self._conn() as conn:
@@ -109,30 +86,6 @@ class Storage:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def upcoming_cases(self, limit: int = 20) -> list[dict]:
-        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M")
-        with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT * FROM cases WHERE hearing_iso IS NOT NULL AND hearing_iso >= ?
-                   ORDER BY hearing_iso ASC LIMIT ?""",
-                (now_iso, limit),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
     def count(self) -> int:
         with self._conn() as conn:
             return conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
-
-    # --------------------------------------------------------------- настройки
-    def get_setting(self, key: str, default=None):
-        with self._conn() as conn:
-            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-            return json.loads(row["value"]) if row else default
-
-    def set_setting(self, key: str, value) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, json.dumps(value, ensure_ascii=False)),
-            )
