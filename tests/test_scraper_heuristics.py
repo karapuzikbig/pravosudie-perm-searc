@@ -155,3 +155,16 @@ def test_clean_ocr_code_keeps_alnum():
     assert _clean_ocr_code(" aB-c1 2! ") == "aBc12"
     assert _clean_ocr_code(None) == ""
     assert _clean_ocr_code("") == ""
+
+
+def test_html_has_captcha_by_structure():
+    from src.scraper import _html_has_captcha
+
+    assert _html_has_captcha('<form id="kcaptchaForm">…</form>') is True
+    assert _html_has_captcha("<input name='captcha-response'>") is True
+    assert _html_has_captcha('<img src="/captcha.php?r=1">') is True
+    assert _html_has_captcha("<html><body>Список дел</body></html>") is False
+    assert _html_has_captcha("captcha.php") is False
+    assert _html_has_captcha(None) is False
+    assert _html_has_captcha("") is False
+

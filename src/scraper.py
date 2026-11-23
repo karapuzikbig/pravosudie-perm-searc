@@ -71,6 +71,27 @@ def _clean_ocr_code(raw: str | None) -> str:
     return "".join(ch for ch in (raw or "") if ch.isalnum())
 
 
+def _html_has_captcha(html: str | None) -> bool:
+    """Есть ли в готовой HTML-разметке элементы формы KCAPTCHA.
+
+    Используется для надёжной проверки во время навигации, когда DOM
+    страницы пересоздаётся и локаторы Playwright временно не находят
+    элементов (то падает, то ложно возвращает «капчи нет»).
+    """
+    if not html:
+        return False
+    low = html.lower()
+    markers = (
+        'id="kcaptchaform"',
+        "id='kcaptchaform'",
+        'name="captcha-response"',
+        "name='captcha-response'",
+    )
+    if any(m in low for m in markers):
+        return True
+    return "captcha.php" in low and "<img" in low
+
+
 class Scraper:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -167,6 +188,14 @@ class Scraper:
                         log.warning("Не нашли форму дел на %s", site_url)
                         if dump:
                             await self._dump(page, f"no_form_{idx:02d}")
+                        continue
+                    # капча могла появиться/не пройти на шаге открытия сайта
+                    if await self._has_captcha(page):
+                        await self._pass_captcha(page, dump)
+                    if await self._has_captcha(page):
+                        log.warning("Капча на %s не пройдена, пропускаю участок", site_url)
+                        if dump:
+                            await self._dump(page, f"captcha_skip_{idx:02d}")
                         continue
                     try:
                         await self._fill_and_submit(page, wanted, dump)
@@ -346,17 +375,30 @@ class Scraper:
         Не полагаемся на текст «дополнительную проверку» или строку
         "/captcha.php": после успешного ввода они могут остаться в разметке
         (ссылки, скрипты) и бесконечно зацикливали ожидание.
+
+        Во время навигации DOM пересоздаётся: локаторы могут временно падать
+        или ничего не находить. Тогда подстраховываемся разбором HTML
+        (page.content()), чтобы не принять промежуточное состояние за успех.
         """
+        found = False
         try:
             if await page.locator("#kcaptchaForm").count() > 0:
-                return True
-            if await page.locator('input[name="captcha-response"]').count() > 0:
-                return True
-            if await page.locator('img[src*="captcha"], img[src*="kcaptcha"]').count() > 0:
-                return True
+                found = True
+            elif await page.locator('input[name="captcha-response"]').count() > 0:
+                found = True
+            elif await page.locator('img[src*="captcha"], img[src*="kcaptcha"]').count() > 0:
+                found = True
+            else:
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        if found:
+            return True
+        # локаторы не нашли — проверяем по HTML (устойчиво к навигации)
+        try:
+            return _html_has_captcha(await page.content())
         except Exception:  # noqa: BLE001
             return False
-        return False
 
     async def _pass_captcha(self, page, dump: bool) -> None:
         """Пройти капчу: авто (ddddocr) с ретраями либо ручной ввод."""
@@ -448,11 +490,23 @@ class Scraper:
             pass
 
     async def _wait_captcha_gone(self, page, timeout_ms: int) -> bool:
+        """Дождаться, пока форма капчи исчезнет после отправки.
+
+        Требуем два подряд подтверждения «капчи нет» с паузой: при отправке
+        страница перезагружается, и одиночная проверка могла застать момент,
+        когда старый DOM уже открепился, а новый ещё не отрисовался — это
+        ложно трактовалось как «капча пройдена».
+        """
         step_ms = 500
         waited = 0
+        misses = 0
         while waited < timeout_ms:
-            if not await self._has_captcha(page):
-                return True
+            if await self._has_captcha(page):
+                misses = 0
+            else:
+                misses += 1
+                if misses >= 2:
+                    return True
             await asyncio.sleep(step_ms / 1000)
             waited += step_ms
         return False
@@ -540,7 +594,6 @@ class Scraper:
 
         date_from = self._date_window()
         date_to = self._date_window_to()
-
         filled_article = False
         for art in articles:
             if await self._fill_admin_article(page, art):
