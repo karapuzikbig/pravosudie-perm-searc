@@ -24,6 +24,8 @@ class ScraperConfig:
     delay_max_between_requests: float = 3.5
     max_pages: int = 20
     captcha_wait_seconds: int = 120
+    captcha_mode: str = "auto"  # auto | manual
+    captcha_max_attempts: int = 8
     screenshot_on_error: bool = True
 
 
@@ -85,6 +87,8 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         delay_max_between_requests=float(scraper_raw.get("delay_max_between_requests", 3.5)),
         max_pages=int(scraper_raw.get("max_pages", 20)),
         captcha_wait_seconds=int(scraper_raw.get("captcha_wait_seconds", 120)),
+        captcha_mode=str(scraper_raw.get("captcha_mode", "auto")).lower(),
+        captcha_max_attempts=int(scraper_raw.get("captcha_max_attempts", 8)),
         screenshot_on_error=bool(scraper_raw.get("screenshot_on_error", True)),
     )
 

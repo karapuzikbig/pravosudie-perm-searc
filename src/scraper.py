@@ -66,6 +66,11 @@ class CaptchaDetected(RuntimeError):
     """Появилась капча — обход нужно остановить."""
 
 
+def _clean_ocr_code(raw: str | None) -> str:
+    """Оставить в распознанном коде капчи только буквы и цифры."""
+    return "".join(ch for ch in (raw or "") if ch.isalnum())
+
+
 class Scraper:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -354,8 +359,121 @@ class Scraper:
         return False
 
     async def _pass_captcha(self, page, dump: bool) -> None:
-        """Ввести капчу вручную в окне браузера и дождаться продолжения."""
+        """Пройти капчу: авто (ddddocr) с ретраями либо ручной ввод."""
         await self._screenshot(page, "captcha")
+        if self.cfg.captcha_mode == "auto":
+            try:
+                if await self._auto_solve_captcha(page, dump):
+                    log.info("Капча решена автоматически")
+                    return
+            except CaptchaDetected:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Авто-решение капчи не удалось (%s), переходим к ручному вводу", exc)
+        await self._manual_captcha(page, dump)
+
+    async def _auto_solve_captcha(self, page, dump: bool) -> bool:
+        """Распознать KCAPTCHA через ddddocr и отправить, с повторными попытками."""
+        try:
+            import ddddocr  # noqa: PLC0415
+        except Exception:  # noqa: BLE001
+            log.info("ddddocr не установлен — авто-решение недоступно")
+            return False
+        if not await self._has_captcha(page):
+            return True
+
+        ocr = ddddocr.DdddOcr(show_ad=False)
+        attempts = max(1, self.cfg.captcha_max_attempts)
+        for attempt in range(1, attempts + 1):
+            img_loc = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
+            if await img_loc.count() == 0:
+                # нет картинки — возможно, капча уже пройдена
+                if not await self._has_captcha(page):
+                    return True
+                return False
+            try:
+                img_bytes = await img_loc.screenshot()
+            except Exception:  # noqa: BLE001
+                return False
+            try:
+                code = _clean_ocr_code(ocr.classification(img_bytes))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("OCR капчи упал: %s", exc)
+                return False
+            log.info("Капча, попытка %d/%d: распознано «%s»", attempt, attempts, code)
+            if not code:
+                await self._reload_captcha(page)
+                continue
+            inp = page.locator('input[name="captcha-response"]').first
+            if await inp.count() == 0:
+                return False
+            try:
+                await inp.fill(code)
+            except Exception:  # noqa: BLE001
+                return False
+            await self._submit_captcha(page)
+            # ждём, пока форма капчи исчезнет (успех) либо обновится (неудача)
+            ok = await self._wait_captcha_gone(page, timeout_ms=8000)
+            if ok:
+                if dump:
+                    await self._dump(page, "after_captcha")
+                return True
+            log.info("Капча не принята (код «%s»), пробуем снова", code)
+            self._pause()
+        return False
+
+    async def _submit_captcha(self, page) -> None:
+        form = page.locator("#kcaptchaForm").first
+        if await form.count() > 0:
+            for sel in ('input[type="submit"]', 'button[type="submit"]', "button"):
+                btn = form.locator(sel).first
+                try:
+                    if await btn.count() > 0:
+                        await btn.click()
+                        return
+                except Exception:  # noqa: BLE001
+                    continue
+        # запасной путь: Enter в поле
+        inp = page.locator('input[name="captcha-response"]').first
+        try:
+            if await inp.count() > 0:
+                await inp.press("Enter")
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        # последняя надежда — любая кнопка «Продолжить»
+        try:
+            await page.get_by_role("button", name="Продолжить").first.click()
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _wait_captcha_gone(self, page, timeout_ms: int) -> bool:
+        step_ms = 500
+        waited = 0
+        while waited < timeout_ms:
+            if not await self._has_captcha(page):
+                return True
+            await asyncio.sleep(step_ms / 1000)
+            waited += step_ms
+        return False
+
+    async def _reload_captcha(self, page) -> None:
+        """Обновить картинку капчи (клик по ней или перезагрузка страницы)."""
+        img_loc = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
+        try:
+            if await img_loc.count() > 0:
+                await img_loc.click()
+                await asyncio.sleep(0.5)
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await page.reload(wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _manual_captcha(self, page, dump: bool) -> None:
+        """Ввести капчу вручную в окне браузера и дождаться продолжения."""
         if self.cfg.headless:
             raise CaptchaDetected(
                 "Сайт участка просит капчу. Запустите в видимом браузере "

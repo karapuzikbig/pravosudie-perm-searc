@@ -147,3 +147,11 @@ def test_collect_precinct_urls_drops_portal_and_bare_msudrf():
     )
     urls = asyncio.run(s._collect_precinct_urls(page))
     assert urls == ["http://5.perm.msudrf.ru/modules.php?name=sud_delo"]
+
+
+def test_clean_ocr_code_keeps_alnum():
+    from src.scraper import _clean_ocr_code
+
+    assert _clean_ocr_code(" aB-c1 2! ") == "aBc12"
+    assert _clean_ocr_code(None) == ""
+    assert _clean_ocr_code("") == ""
