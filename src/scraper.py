@@ -1,20 +1,18 @@
-"""Скрейпер ГАС «Правосудие» на Playwright.
+"""Скрейпер ГАС «Правосудие» на Playwright (мировые судьи, поиск дел).
 
-Раздел «Судебное делопроизводство» / поиск дел ГАС «Правосудие» имеет
-динамическую вёрстку, поэтому здесь намеренно несколько защитных стратегий:
+Навигация и заполнение формы сделаны УСТОЙЧИВО к вёрстке:
+  * заходим на портал и, если нужно, переходим в раздел «Судебное делопроизводство»
+    по набору известных ссылок (а не по одному жёсткому селектору);
+  * форму ищем эвристически: по всем <form> на странице, поля сопоставляем по
+    подписям (label/текст опций) и по именам (article/region/city/date);
+  * заполняем найденные поля, отправляем ту форму, у которой есть «Найти».
 
-  1) Поиск ссылки/пункта меню модуля судебного делопроизводства.
-  2) Заполнение формы: тип суда, регион, город, статья, дата.
-  3) Пагинация с предохранителем max_pages.
-  4) При любой проблеме — лог, скриншот (logs/) и уведомление.
+Для диагностики (когда вёрстка изменилась) есть режим дампа:
 
-Скрейпер НЕ работает из песочницы без доступа к sudrf.ru. Запуск для
-отладки на VPS:
+    python -m src.scraper --dump --headful
 
-    python -m src.scraper --debug --headful
-
-селекторы централизованы в SELECTORS, чтобы их можно было править в одном
-месте, не трогая логику.
+Он сохраняет в logs/ HTML и скриншот каждого шага, чтобы можно было увидеть,
+что реально отдаёт сайт, и поправить правила в одном месте.
 """
 from __future__ import annotations
 
@@ -22,6 +20,7 @@ import argparse
 import logging
 import random
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,68 +29,34 @@ from .parsers import Case, parse_case_html
 
 log = logging.getLogger(__name__)
 
-# Базовый адрес портала ГАС «Правосудие»
-BASE_URL = "https://sudrf.ru"
+# Входные точки портала ГАС «Правосудие» (проверяются по очереди).
+ENTRY_URLS = [
+    "https://sudrf.ru/modules.php?name=sud_delo",
+    "https://sudrf.ru/",
+]
 
-# Стратегии поиска ссылки на раздел «Судебное делопроизводство».
-# Проверяются по очереди, пока одна не сработает.
-SELECTORS: dict[str, list[str]] = {
-    "case_search_link": [
-        'a[href*="sud_delo"]',
-        'a[href*="sudoproizvodstvo"]',
-        'a[href*="delo"]',
-        'a:has-text("Судебное делопроизводство")',
-        'a:has-text("Поиск дел")',
-    ],
-    "court_type_select": [
-        'select[name*="court"]',
-        'select#courtType',
-        'select:has(option:has-text("Мировой"))',
-    ],
-    "region_select": [
-        'select[name*="region"]',
-        'select#region',
-    ],
-    "city_select": [
-        'select[name*="city"]',
-        'select#city',
-    ],
-    "article_input": [
-        'input[name*="article"]',
-        'input[name*="koap"]',
-        'input[placeholder*="тать"]',
-    ],
-    "date_from_input": [
-        'input[name*="date_from"]',
-        'input[name*="dateFrom"]',
-        'input[type="date"]',
-    ],
-    "submit_button": [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button:has-text("Найти")',
-        'button:has-text("Поиск")',
-    ],
-    "results_container": [
-        "table",
-        ".results",
-        "#results",
-    ],
-    "next_page": [
-        'a:has-text("Следующая")',
-        'a[rel="next"]',
-        ".pagination a.next",
-    ],
-    "captcha": [
-        "img[src*='captcha']",
-        "#captcha",
-        ".captcha",
-    ],
+# Ссылки-переходы в раздел судебного делопроизводства.
+SEARCH_LINK_TEXTS = ("судебное делопроизводство", "поиск дел", "найти дело", "дела")
+
+# Текстовые подсказки для полей формы (по подписи рядом / тексту опций).
+FIELD_HINTS = {
+    "article": ("статья", "статьи", "коап"),
+    "region": ("регион", "субъект", "область", "край"),
+    "city": ("город", "насел"),
+    "court": ("суд", "участок", "мировой"),
+    "date_from": ("дата", "с", "нач", "период"),
+}
+
+# Эвристики по значениям <option> для выбора нужного пункта.
+OPTION_HINTS = {
+    "court": ("миров",),
+    "region": ("пермск",),
+    "city": ("пермь",),
 }
 
 
 class CaptchaDetected(RuntimeError):
-    """Появилась капча — обход нужно остановить и уведомить админа."""
+    """Появилась капча — обход нужно остановить."""
 
 
 class Scraper:
@@ -105,54 +70,49 @@ class Scraper:
     def _pause(self) -> None:
         lo = self.cfg.delay_min_between_requests
         hi = max(lo, self.cfg.delay_max_between_requests)
-        import time
-
         time.sleep(random.uniform(lo, hi))
 
-    async def _first(self, page, strategy_key: str):
-        """Вернуть первый найденный локатор по списку селекторов."""
-        for sel in SELECTORS[strategy_key]:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0:
-                    return loc
-            except Exception:  # noqa: BLE001 - селектор может быть невалиден
-                continue
-        return None
-
-    async def _check_captcha(self, page) -> None:
-        for sel in SELECTORS["captcha"]:
-            try:
-                if await page.locator(sel).first.count() > 0:
-                    await self._screenshot(page, "captcha")
-                    raise CaptchaDetected("Обнаружена капча на ГАС «Правосудие»")
-            except CaptchaDetected:
-                raise
-            except Exception:  # noqa: BLE001
-                continue
-
-    async def _screenshot(self, page, tag: str) -> None:
-        if not self.cfg.screenshot_on_error:
-            return
+    async def _screenshot(self, page, tag: str) -> Path | None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self.logs_dir / f"{tag}_{ts}.png"
         try:
             await page.screenshot(path=str(path), full_page=True)
             log.warning("Скриншот сохранён: %s", path)
+            return path
         except Exception:  # noqa: BLE001
             log.exception("Не удалось сохранить скриншот")
+            return None
 
-    def _date_window(self) -> tuple[str, str]:
+    async def _dump(self, page, tag: str) -> None:
+        """Сохранить HTML и скриншот страницы (для диагностики вёрстки)."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        html_path = self.logs_dir / f"{tag}_{ts}.html"
+        try:
+            html = await page.content()
+            html_path.write_text(html, encoding="utf-8")
+            log.info("HTML сохранён: %s (url=%s)", html_path, page.url)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось сохранить HTML")
+        await self._screenshot(page, tag)
+
+    async def _check_captcha(self, page) -> None:
+        try:
+            html = (await page.content()).lower()
+        except Exception:  # noqa: BLE001
+            return
+        if "captcha" in html and ("введите" in html or "введите код" in html):
+            await self._screenshot(page, "captcha")
+            raise CaptchaDetected("Сайт просит ввести капчу")
+
+    def _date_window(self) -> str:
         today = datetime.now()
         date_from = today - timedelta(days=self.settings.lookback_days)
-        # Верхнюю границу берём с запасом — будущие заседания
-        date_to = today + timedelta(days=90)
-        fmt = "%d.%m.%Y"
-        return date_from.strftime(fmt), date_to.strftime(fmt)
+        return date_from.strftime("%d.%m.%Y")
 
     # --------------------------------------------------------------- основной
-    async def fetch_cases(self, articles: list[str] | None = None) -> list[Case]:
-        """Собрать дела по указанным статьям (по умолчанию — из настроек)."""
+    async def fetch_cases(
+        self, articles: list[str] | None = None, dump: bool = False
+    ) -> list[Case]:
         wanted = articles or self.settings.default_articles
         from playwright.async_api import async_playwright
 
@@ -162,30 +122,24 @@ class Scraper:
             context = await browser.new_context(
                 locale="ru-RU",
                 user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
                 ),
             )
             page = await context.new_page()
             page.set_default_timeout(self.cfg.timeout_ms)
             try:
-                await self._open_search(page)
-                await self._fill_form(page, wanted)
+                await self._open_search(page, dump)
+                await self._fill_and_submit(page, wanted, dump)
+                if dump:
+                    await self._dump(page, "after_submit")
                 for _ in range(self.cfg.max_pages):
                     await self._check_captcha(page)
                     html = await page.content()
                     for case in parse_case_html(html, url=page.url):
                         if not case.article or case.matches_articles(wanted):
                             collected.setdefault(case.uid, case)
-                    nxt = await self._first(page, "next_page")
-                    if not nxt:
-                        break
-                    self._pause()
-                    try:
-                        await nxt.click()
-                        await page.wait_for_load_state("networkidle")
-                    except Exception:  # noqa: BLE001
-                        log.info("Пагинация завершена или недоступна")
+                    if not await self._goto_next_page(page):
                         break
             except CaptchaDetected:
                 raise
@@ -199,86 +153,239 @@ class Scraper:
         log.info("Собрано уникальных дел: %d", len(collected))
         return list(collected.values())
 
-    async def _open_search(self, page) -> None:
-        await page.goto(BASE_URL, wait_until="domcontentloaded")
-        link = await self._first(page, "case_search_link")
-        if link is None:
-            log.warning("Ссылка на судебное делопроизводство не найдена на главной")
-            return
+    # ---------------------------------------------------------- навигация
+    async def _open_search(self, page, dump: bool) -> None:
+        """Открыть портал и перейти в раздел судебного делопроизводства."""
+        last_error: Exception | None = None
+        for url in ENTRY_URLS:
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+                if dump:
+                    await self._dump(page, "entry")
+                if await self._page_has_form(page):
+                    log.info("Форма поиска уже на странице %s", url)
+                    return
+                if await self._click_search_link(page):
+                    log.info("Перешли в раздел делопроизводства")
+                    return
+                log.info("На %s формы/ссылки нет, пробуем следующий адрес", url)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                log.warning("Не удалось открыть %s: %s", url, exc)
+        if dump:
+            await self._dump(page, "no_form")
+        if last_error:
+            raise RuntimeError(f"Не удалось открыть портал: {last_error}")
+        raise RuntimeError(
+            "Не нашли форму поиска дел. Запустите 'python -m src.scraper --dump --headful' "
+            "и пришлите файл из logs/ — подстроим навигацию под текущую вёрстку."
+        )
+
+    async def _page_has_form(self, page) -> bool:
+        try:
+            return await page.locator("form").count() > 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _click_search_link(self, page) -> bool:
+        for text in SEARCH_LINK_TEXTS:
+            try:
+                link = page.get_by_role("link", name=text).first
+                if await link.count() > 0:
+                    self._pause()
+                    await link.click()
+                    await page.wait_for_load_state("domcontentloaded")
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    # ------------------------------------------------------- форма поиска
+    async def _fill_and_submit(self, page, articles: list[str], dump: bool) -> None:
+        """Эвристически заполнить поля поиска и отправить форму."""
+        values = {
+            "article": articles[0],
+            "region": self.settings.region,
+            "city": self.settings.city,
+            "court": self.settings.court_type,
+            "date_from": self._date_window(),
+        }
+
+        filled_any = False
+        # SELECT-поля: выбираем нужную опцию по тексту
+        for select in await page.locator("select").all():
+            key = await self._select_key(select)
+            if not key:
+                continue
+            hint = OPTION_HINTS.get(key)
+            if hint and await self._select_option_by_hint(select, hint):
+                filled_any = True
+                log.info("Выбрано поле '%s' = %s", key, hint)
+            elif key in ("region", "city", "court"):
+                target = values.get(key, "")
+                if target and await self._select_option_by_text(select, target):
+                    filled_any = True
+                    log.info("Выбрано поле '%s' = %s", key, target)
+
+        # INPUT-поля: статья и дата
+        for inp in await page.locator("input").all():
+            itype = (await inp.get_attribute("type") or "text").lower()
+            if itype in ("submit", "button", "hidden", "checkbox", "radio", "file", "image"):
+                continue
+            key = await self._input_key(inp)
+            if key == "article" and values["article"]:
+                try:
+                    await inp.fill(values["article"])
+                    filled_any = True
+                    log.info("Заполнена статья: %s", values["article"])
+                except Exception:  # noqa: BLE001
+                    pass
+            elif key == "date_from" and values["date_from"]:
+                try:
+                    await inp.fill(values["date_from"])
+                    filled_any = True
+                    log.info("Заполнена дата с: %s", values["date_from"])
+                except Exception:  # noqa: BLE001
+                    pass
+
+        if dump:
+            await self._dump(page, "filled")
+
+        submit = await self._find_submit(page)
+        if submit is None:
+            raise RuntimeError(
+                "Не нашли кнопку «Найти» в форме поиска. "
+                "Запустите 'python -m src.scraper --dump --headful' и пришлите logs/."
+            )
+        if not filled_any:
+            log.warning("Не удалось распознать поля формы — отправляем как есть")
         self._pause()
         try:
-            await link.click()
-            await page.wait_for_load_state("networkidle")
+            await submit.click()
         except Exception:  # noqa: BLE001
-            log.warning("Переход по ссылке делопроизводства не удался")
+            await submit.press("Enter")
+        await page.wait_for_load_state("domcontentloaded")
 
-    async def _fill_form(self, page, articles: list[str]) -> None:
-        # тип суда
-        loc = await self._first(page, "court_type_select")
-        if loc:
+    async def _select_key(self, select) -> str | None:
+        """Определить назначение <select> по подписи/опциям/имени."""
+        try:
+            name = (await select.get_attribute("name") or "").lower()
+            ident = (await select.get_attribute("id") or "").lower()
+            options_text = " ".join(
+                [(await o.inner_text()).lower() for o in await select.locator("option").all()]
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        haystack = f"{name} {ident} {options_text}"
+        for key, hints in FIELD_HINTS.items():
+            if any(h in haystack for h in hints):
+                return key
+        # по значениям опций
+        if "пермск" in options_text:
+            return "region"
+        if "пермь" in options_text:
+            return "city"
+        if "миров" in options_text:
+            return "court"
+        return None
+
+    async def _select_option_by_hint(self, select, hints: tuple[str, ...]) -> bool:
+        options = await select.locator("option").all()
+        for opt in options:
             try:
-                await loc.select_option(label=self.settings.court_type)
+                text = (await opt.inner_text()).lower()
+                value = (await opt.get_attribute("value")) or ""
             except Exception:  # noqa: BLE001
-                log.warning("Не удалось выбрать тип суда '%s'", self.settings.court_type)
+                continue
+            if value == "":
+                continue
+            if any(h in text for h in hints):
+                try:
+                    await select.select_option(value=value)
+                    return True
+                except Exception:  # noqa: BLE001
+                    continue
+        return False
 
-        # регион
-        loc = await self._first(page, "region_select")
-        if loc:
+    async def _select_option_by_text(self, select, target: str) -> bool:
+        try:
+            await select.select_option(label=target)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+        t = target.lower()
+        return await self._select_option_by_hint(select, (t,))
+
+    async def _input_key(self, inp) -> str | None:
+        try:
+            name = (await inp.get_attribute("name") or "").lower()
+            ident = (await inp.get_attribute("id") or "").lower()
+            placeholder = (await inp.get_attribute("placeholder") or "").lower()
+        except Exception:  # noqa: BLE001
+            return None
+        haystack = f"{name} {ident} {placeholder}"
+        if any(k in haystack for k in ("article", "koap", "стать")):
+            return "article"
+        if any(k in haystack for k in ("date", "дат")):
+            return "date_from"
+        return None
+
+    async def _find_submit(self, page):
+        for sel in (
+            'input[type="submit"]',
+            'button[type="submit"]',
+            'button',
+            'input[type="button"]',
+            'a[role="button"]',
+        ):
             try:
-                await loc.select_option(label=self.settings.region)
+                loc = page.locator(sel)
+                count = await loc.count()
             except Exception:  # noqa: BLE001
-                log.warning("Не удалось выбрать регион '%s'", self.settings.region)
+                continue
+            for i in range(count):
+                el = loc.nth(i)
+                try:
+                    text = ((await el.inner_text()) or "").lower()
+                    value = ((await el.get_attribute("value")) or "").lower()
+                except Exception:  # noqa: BLE001
+                    continue
+                if any(k in text or k in value for k in ("найти", "поиск", "искать", "search")):
+                    return el
+        # запасной вариант — первая кнопка submit
+        loc = page.locator('input[type="submit"], button[type="submit"]')
+        if await loc.count() > 0:
+            return loc.first
+        return None
 
-        # город
-        loc = await self._first(page, "city_select")
-        if loc:
+    async def _goto_next_page(self, page) -> bool:
+        for text in ("следующая", "далее", "»"):
             try:
-                await loc.select_option(label=self.settings.city)
+                link = page.get_by_role("link", name=text).first
+                if await link.count() > 0:
+                    self._pause()
+                    await link.click()
+                    await page.wait_for_load_state("domcontentloaded")
+                    return True
             except Exception:  # noqa: BLE001
-                log.warning("Не удалось выбрать город '%s'", self.settings.city)
-
-        # статья (первая из списка забивается в форму; остальные фильтруем
-        # по результатам на нашей стороне в fetch_cases)
-        loc = await self._first(page, "article_input")
-        if loc:
-            try:
-                await loc.fill(articles[0])
-            except Exception:  # noqa: BLE001
-                log.warning("Не удалось заполнить статью")
-
-        # дата
-        date_from, _ = self._date_window()
-        loc = await self._first(page, "date_from_input")
-        if loc:
-            try:
-                await loc.fill(date_from)
-            except Exception:  # noqa: BLE001
-                log.warning("Не удалось заполнить дату начала (%s)", date_from)
-
-        # отправка
-        submit = await self._first(page, "submit_button")
-        if submit is None:
-            raise RuntimeError("Кнопка поиска не найдена — вероятно, изменилась вёрстка")
-        self._pause()
-        await submit.click()
-        await page.wait_for_load_state("networkidle")
+                continue
+        return False
 
 
-async def _run_debug(headful: bool = False, articles: list[str] | None = None) -> int:
+async def _run_debug(headful: bool = False, articles: list[str] | None = None, dump: bool = False) -> int:
     from .config import load_settings
 
     settings = load_settings()
     settings.scraper.headless = not headful
     scraper = Scraper(settings)
     try:
-        cases = await scraper.fetch_cases(articles)
+        cases = await scraper.fetch_cases(articles, dump=dump)
     except CaptchaDetected as exc:
         print(f"[!] {exc}")
         return 2
     except Exception as exc:  # noqa: BLE001
         print(f"[!] Не удалось собрать дела: {exc}")
-        print("    Проверьте: доступ к sudrf.ru, установлен ли браузер (playwright install chromium),")
-        print("    и, при необходимости, поправьте селекторы в SELECTORS (src/scraper.py).")
+        print("    Диагностика: python -m src.scraper --dump --headful")
         return 1
     print(f"Найдено дел: {len(cases)}")
     for c in cases:
@@ -290,6 +397,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Отладочный запуск скрейпера ГАС «Правосудие»")
     parser.add_argument("--debug", action="store_true", help="подробные логи")
     parser.add_argument("--headful", action="store_true", help="показать окно браузера")
+    parser.add_argument("--dump", action="store_true", help="сохранять HTML и скриншоты шагов в logs/")
     parser.add_argument("--articles", help="статьи через запятую, напр. '12.8,20.20'")
     args = parser.parse_args()
     logging.basicConfig(
@@ -301,7 +409,7 @@ def main() -> int:
     articles = parse_articles(args.articles) if args.articles else None
     import asyncio
 
-    return asyncio.run(_run_debug(headful=args.headful, articles=articles))
+    return asyncio.run(_run_debug(headful=args.headful, articles=articles, dump=args.dump))
 
 
 if __name__ == "__main__":

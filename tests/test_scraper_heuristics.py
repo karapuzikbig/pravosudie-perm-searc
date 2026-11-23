@@ -1,0 +1,84 @@
+"""Тесты эвристик скрейпера без браузера (фейковые локаторы Playwright)."""
+from __future__ import annotations
+
+import asyncio
+
+from src.config import load_settings
+from src.scraper import Scraper
+
+
+class FakeOption:
+    def __init__(self, text, value):
+        self._text = text
+        self._value = value
+
+    async def inner_text(self):
+        return self._text
+
+    async def get_attribute(self, name):
+        return self._value if name == "value" else None
+
+
+class FakeList:
+    def __init__(self, items):
+        self._items = items
+
+    async def all(self):
+        return self._items
+
+    async def count(self):
+        return len(self._items)
+
+
+class FakeSelect:
+    def __init__(self, name, options):
+        self.name = name
+        self.options = [FakeOption(t, v) for t, v in options]
+        self.selected = None
+
+    async def get_attribute(self, name):
+        return self.name if name == "name" else None
+
+    def locator(self, _sel):
+        return FakeList(self.options)
+
+    async def select_option(self, value=None, label=None):
+        for o in self.options:
+            if value is not None and o._value == value:
+                self.selected = o._text
+                return
+            if label is not None and o._text == label:
+                self.selected = o._text
+                return
+        raise ValueError("no option")
+
+
+def _scraper():
+    settings = load_settings()
+    return Scraper(settings)
+
+
+def test_select_key_detects_regions():
+    s = _scraper()
+    sel = FakeSelect("region", [("Пермский край", "59"), ("Свердловская область", "66")])
+    assert asyncio.run(s._select_key(sel)) == "region"
+
+
+def test_select_option_by_hint_picks_perm_region():
+    s = _scraper()
+    sel = FakeSelect("subject", [("Свердловская область", "66"), ("Пермский край", "59")])
+    assert asyncio.run(s._select_option_by_hint(sel, ("пермск",)))
+    assert sel.selected == "Пермский край"
+
+
+def test_select_key_detects_court():
+    s = _scraper()
+    sel = FakeSelect("x", [("Мировой судья", "1"), ("Районный суд", "2")])
+    assert asyncio.run(s._select_key(sel)) == "court"
+
+
+def test_select_option_by_text_exact():
+    s = _scraper()
+    sel = FakeSelect("city", [("Пермь", "p"), ("Березники", "b")])
+    assert asyncio.run(s._select_option_by_text(sel, "Пермь"))
+    assert sel.selected == "Пермь"
