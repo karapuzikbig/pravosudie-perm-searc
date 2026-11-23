@@ -35,4 +35,10 @@ scraper:
   captcha_mode: "auto"      # auto — распознавать капчу (ddddocr) с ретраями; manual — вводить вручную
   captcha_max_attempts: 8   # сколько раз пробовать распознать капчу за один заход
   captcha_wait_seconds: 120 # сколько ждать ручного ввода капчи (режим manual / запасной)
+  # Vision-модель — «тяжёлая артиллерия», если локальный OCR (ddddocr) не справляется.
+  # Нужен ключ в .env: VISION_API_KEY (или OPENAI_API_KEY). Работает по OpenAI-
+  # совместимому API, поэтому можно указать другой base_url и модель.
+  captcha_vision_enabled: true
+  captcha_vision_model: "gpt-4o-mini"
+  captcha_vision_base_url: "https://api.openai.com/v1"
   screenshot_on_error: true # сохранять скриншот в logs/ при сбое парсинга

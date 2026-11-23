@@ -185,3 +185,10 @@ def test_prepare_captcha_variants_degrades_on_bad_bytes():
     assert variants == [b"not-an-image"]
 
 
+def test_vision_solver_no_key_returns_none():
+    from src.captcha_ai import solve_captcha_vision
+
+    assert solve_captcha_vision(b"img", api_key="") is None
+    assert solve_captcha_vision(b"", api_key="k") is None
+
+

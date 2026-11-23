@@ -485,17 +485,27 @@ class Scraper:
         await self._manual_captcha(page, dump)
 
     async def _auto_solve_captcha(self, page, dump: bool) -> bool:
-        """Распознать KCAPTCHA через ddddocr и отправить, с повторными попытками."""
+        """Распознать KCAPTCHA: сначала локально (ddddocr), затем vision-модель.
+
+        Локальный OCR бесплатный и быстрый, поэтому пробуем его первым. Если
+        он недоступен, несколько раз подряд не дал уверенного кода или сервер
+        отверг распознанное — подключаем vision-модель (если задан ключ).
+        """
+        ocr = None
         try:
             import ddddocr  # noqa: PLC0415
+
+            ocr = ddddocr.DdddOcr(show_ad=False)
         except Exception:  # noqa: BLE001
-            log.info("ddddocr не установлен — авто-решение недоступно")
-            return False
+            log.info("ddddocr недоступен — полагаемся на vision-модель")
         if not await self._has_captcha(page):
             return True
 
-        ocr = ddddocr.DdddOcr(show_ad=False)
+        vision_key = getattr(self.settings, "vision_api_key", "")
+        vision_allowed = self.cfg.captcha_vision_enabled and bool(vision_key)
+
         attempts = max(1, self.cfg.captcha_max_attempts)
+        local_failures = 0
         for attempt in range(1, attempts + 1):
             img_loc = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
             if await img_loc.count() == 0:
@@ -507,44 +517,96 @@ class Scraper:
                 img_bytes = await self._fetch_captcha_image(page, img_loc)
             except Exception:  # noqa: BLE001
                 return False
-            variants = _prepare_captcha_variants(img_bytes)
-            codes: list[str] = []
-            try:
-                for var in variants:
-                    try:
-                        codes.append(_clean_ocr_code(ocr.classification(var)))
-                    except Exception:  # noqa: BLE001
-                        continue
-                code = _vote_codes(codes)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("OCR капчи упал: %s", exc)
-                return False
-            log.info(
-                "Капча, попытка %d/%d: варианты=%s → «%s»",
-                attempt,
-                attempts,
-                [c for c in (_clean_ocr_code(x) for x in codes) if c],
-                code,
-            )
+
+            code = ""
+            source = "ocr"
+            if ocr is not None and local_failures < 2:
+                code = self._local_ocr(ocr, img_bytes, attempt, attempts)
+            if not code and vision_allowed:
+                source = "vision"
+                for cand in self._vision_ocr(img_bytes):
+                    if await self._try_captcha_code(page, cand, dump):
+                        return True
+                # vision не помог — одна неудачная попытка, идём дальше
+                local_failures += 1
+                self._pause()
+                continue
             if not code:
+                # локальный OCR пуст и vision недоступен — перерисовать капчу
+                if ocr is not None:
+                    local_failures += 1
                 await self._reload_captcha(page)
                 continue
-            inp = page.locator('input[name="captcha-response"]').first
-            if await inp.count() == 0:
-                return False
-            try:
-                await inp.fill(code)
-            except Exception:  # noqa: BLE001
-                return False
-            await self._submit_captcha(page)
-            # ждём, пока форма капчи исчезнет (успех) либо обновится (неудача)
-            ok = await self._wait_captcha_gone(page, timeout_ms=8000)
-            if ok:
-                if dump:
-                    await self._dump(page, "after_captcha")
+
+            if await self._try_captcha_code(page, code, dump):
                 return True
-            log.info("Капча не принята (код «%s»), пробуем снова", code)
+            log.info("Капча не принята (код «%s», %s), пробуем снова", code, source)
+            local_failures += 1
             self._pause()
+        return False
+
+    def _local_ocr(self, ocr, img_bytes: bytes, attempt: int, attempts: int) -> str:
+        """Локальное распознавание с предобработкой и голосованием вариантов."""
+        try:
+            variants = _prepare_captcha_variants(img_bytes)
+            codes: list[str] = []
+            for var in variants:
+                try:
+                    codes.append(_clean_ocr_code(ocr.classification(var)))
+                except Exception:  # noqa: BLE001
+                    continue
+            code = _vote_codes(codes)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("OCR капчи упал: %s", exc)
+            return ""
+        log.info(
+            "Капча, попытка %d/%d: варианты=%s → «%s»",
+            attempt,
+            attempts,
+            [c for c in codes if c],
+            code,
+        )
+        return code
+
+    def _vision_ocr(self, img_bytes: bytes) -> list[str]:
+        """Спросить vision-модель; вернуть список кандидатов (возможно пустой)."""
+        try:
+            from .captcha_ai import solve_captcha_vision  # noqa: PLC0415
+        except Exception:  # noqa: BLE001
+            return []
+        code = solve_captcha_vision(
+            img_bytes,
+            api_key=getattr(self.settings, "vision_api_key", ""),
+            model=self.cfg.captcha_vision_model,
+            base_url=self.cfg.captcha_vision_base_url,
+        )
+        if not code:
+            return []
+        # иногда модели возвращают и заглавные, и в нижнем регистре — пробуем оба
+        variants = [code]
+        if code.lower() != code:
+            variants.append(code.lower())
+        if code.upper() != code:
+            variants.append(code.upper())
+        return variants
+
+    async def _try_captcha_code(self, page, code: str, dump: bool) -> bool:
+        """Ввести код капчи, отправить и проверить, принят ли."""
+        if not code:
+            return False
+        inp = page.locator('input[name="captcha-response"]').first
+        if await inp.count() == 0:
+            return False
+        try:
+            await inp.fill(code)
+        except Exception:  # noqa: BLE001
+            return False
+        await self._submit_captcha(page)
+        ok = await self._wait_captcha_gone(page, timeout_ms=8000)
+        if ok:
+            if dump:
+                await self._dump(page, "after_captcha")
+            return True
         return False
 
     async def _fetch_captcha_image(self, page, img_loc) -> bytes:
