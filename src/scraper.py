@@ -336,15 +336,22 @@ class Scraper:
         return False
 
     async def _has_captcha(self, page) -> bool:
+        """Капча определяется только по реальным элементам формы ввода.
+
+        Не полагаемся на текст «дополнительную проверку» или строку
+        "/captcha.php": после успешного ввода они могут остаться в разметке
+        (ссылки, скрипты) и бесконечно зацикливали ожидание.
+        """
         try:
             if await page.locator("#kcaptchaForm").count() > 0:
                 return True
             if await page.locator('input[name="captcha-response"]').count() > 0:
                 return True
-            html = (await page.content()).lower()
+            if await page.locator('img[src*="captcha"], img[src*="kcaptcha"]').count() > 0:
+                return True
         except Exception:  # noqa: BLE001
             return False
-        return "дополнительную проверку" in html or "/captcha.php" in html
+        return False
 
     async def _pass_captcha(self, page, dump: bool) -> None:
         """Ввести капчу вручную в окне браузера и дождаться продолжения."""
@@ -364,6 +371,8 @@ class Scraper:
         while waited < deadline:
             if not await self._has_captcha(page):
                 log.info("Капча пройдена, продолжаем")
+                if dump:
+                    await self._dump(page, "after_captcha")
                 return
             await asyncio.sleep(step)
             waited += step
