@@ -129,6 +129,7 @@ class Scraper:
             browser = await pw.chromium.launch(headless=self.cfg.headless)
             context = await browser.new_context(
                 locale="ru-RU",
+                ignore_https_errors=True,
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -296,8 +297,8 @@ class Scraper:
         for attempt in (1, 2):
             try:
                 await page.goto(site_url, wait_until="domcontentloaded")
-            except Exception:  # noqa: BLE001
-                log.warning("Не открылся %s (попытка %d)", site_url, attempt)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Не открылся %s (попытка %d): %s", site_url, attempt, exc)
                 self._pause()
                 continue
             if not await self._is_blocked(page):
