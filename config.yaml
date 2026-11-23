@@ -32,4 +32,5 @@ scraper:
   delay_min_between_requests: 1.5   # секунды, нижняя граница случайной паузы
   delay_max_between_requests: 3.5   # секунды, верхняя граница
   max_pages: 20             # предохранитель от зацикливания пагинации
+  captcha_wait_seconds: 120 # сколько ждать ручного ввода капчи в видимом браузере
   screenshot_on_error: true # сохранять скриншот в logs/ при сбое парсинга

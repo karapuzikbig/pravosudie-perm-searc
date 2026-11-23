@@ -5,9 +5,10 @@
      субъект РФ (#ms_subj, напр. «Пермский край») → «Найти»;
   2. Со страницы списка собираем ссылки на сайты судебных участков
      (вида NN.perm.msudrf.ru);
-  3. По каждому участку открываем модуль судебного делопроизводства
-     (modules.php?name=sud_delo), заполняем период и собираем дела,
-     затем оставляем только подходящие по статьям КоАП.
+  3. По каждому участку открываем /modules.php?name=sud_delo&op=hl,
+     при необходимости проходим капчу (ручной ввод в видимом браузере),
+     заполняем период и собираем дела, оставляя только подходящие
+     по статьям КоАП.
 
 Поля формы и кнопки ищутся эвристически (по именам/подписям), ссылки на
 участки — по домену msudrf.ru. Это делает код устойчивым к смене вёрстки.
@@ -22,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import random
 import sys
@@ -100,15 +102,6 @@ class Scraper:
             log.exception("Не удалось сохранить HTML")
         await self._screenshot(page, tag)
 
-    async def _check_captcha(self, page) -> None:
-        try:
-            html = (await page.content()).lower()
-        except Exception:  # noqa: BLE001
-            return
-        if "captcha" in html and ("введите" in html or "введите код" in html):
-            await self._screenshot(page, "captcha")
-            raise CaptchaDetected("Сайт просит ввести капчу")
-
     def _date_window(self) -> str:
         today = datetime.now()
         date_from = today - timedelta(days=self.settings.lookback_days)
@@ -178,7 +171,8 @@ class Scraper:
                     if dump:
                         await self._dump(page, f"after_submit_{idx:02d}")
                     for _ in range(self.cfg.max_pages):
-                        await self._check_captcha(page)
+                        if await self._has_captcha(page):
+                            await self._pass_captcha(page, dump)
                         html = await page.content()
                         for case in parse_case_html(html, url=page.url):
                             if not case.article or case.matches_articles(wanted):
@@ -310,26 +304,74 @@ class Scraper:
         return False
 
     async def _open_case_search_on_site(self, page, site_url: str, dump: bool) -> bool:
-        """На сайте участка открыть модуль судебного делопроизводства."""
+        """На сайте участка открыть модуль судебного делопроизводства (op=hl)."""
         if not await self._open_site_with_retry(page, site_url, dump):
             if dump:
                 await self._dump(page, "site_no_form")
             return False
-        # главная открылась — ищем форму прямо на ней, затем по ссылке меню
+        # настоящий адрес модуля дел: /modules.php?name=sud_delo&op=hl
+        delo_url = site_url.rstrip("/") + "/modules.php?name=sud_delo&op=hl"
+        try:
+            await page.goto(delo_url, wait_until="domcontentloaded")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не открылся модуль дел на %s: %s", site_url, exc)
+            return False
+        if await self._is_blocked(page):
+            log.warning("403 на модуле дел %s", site_url)
+            return False
+        # модуль может сразу выдать капчу («дополнительную проверку»)
+        if await self._has_captcha(page):
+            await self._pass_captcha(page, dump)
         if await self._page_has_form(page):
             return True
+        await self._pause()
         if await self._click_link_texts(
             page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
         ):
-            if await self._is_blocked(page):
-                log.warning("403 после перехода в делопроизводство на %s", site_url)
-                if dump:
-                    await self._dump(page, "site_no_form")
-                return False
+            if await self._has_captcha(page):
+                await self._pass_captcha(page, dump)
             return await self._page_has_form(page)
         if dump:
             await self._dump(page, "site_no_form")
         return False
+
+    async def _has_captcha(self, page) -> bool:
+        try:
+            if await page.locator("#kcaptchaForm").count() > 0:
+                return True
+            if await page.locator('input[name="captcha-response"]').count() > 0:
+                return True
+            html = (await page.content()).lower()
+        except Exception:  # noqa: BLE001
+            return False
+        return "дополнительную проверку" in html or "/captcha.php" in html
+
+    async def _pass_captcha(self, page, dump: bool) -> None:
+        """Ввести капчу вручную в окне браузера и дождаться продолжения."""
+        await self._screenshot(page, "captcha")
+        if self.cfg.headless:
+            raise CaptchaDetected(
+                "Сайт участка просит капчу. Запустите в видимом браузере "
+                "(headless: false в config.yaml) — тогда капчу можно будет ввести вручную."
+            )
+        log.warning(
+            "=== ВВЕДИТЕ КАПЧУ В ОКНЕ БРАУЗЕРА и нажмите «Продолжить» (ждём до %d с) ===",
+            self.cfg.captcha_wait_seconds,
+        )
+        deadline = self.cfg.captcha_wait_seconds
+        waited = 0.0
+        step = 1.0
+        while waited < deadline:
+            if not await self._has_captcha(page):
+                log.info("Капча пройдена, продолжаем")
+                return
+            await asyncio.sleep(step)
+            waited += step
+        await self._screenshot(page, "captcha_timeout")
+        raise CaptchaDetected(
+            "Капча не введена за отведённое время. Увеличьте captcha_wait_seconds "
+            "в config.yaml или введите код быстрее."
+        )
 
     async def _page_has_form(self, page) -> bool:
         try:
@@ -571,7 +613,6 @@ def main() -> int:
     from .config import parse_articles
 
     articles = parse_articles(args.articles) if args.articles else None
-    import asyncio
 
     return asyncio.run(_run_debug(headful=args.headful, articles=articles, dump=args.dump))
 
