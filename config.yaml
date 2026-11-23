@@ -27,7 +27,7 @@ lookback_days: 7
 
 # Параметры скрейпера
 scraper:
-  headless: true            # false — видно окно браузера (для отладки)
+  headless: false           # false — видно окно браузера; true — без окна (может ловить 403)
   timeout_ms: 30000         # таймаут ожидания элементов
   delay_min_between_requests: 1.5   # секунды, нижняя граница случайной паузы
   delay_max_between_requests: 3.5   # секунды, верхняя граница
