@@ -74,6 +74,11 @@ def extract_code(text: str | None) -> str:
     return "".join(ch for ch in text if ch in _ALLOWED)
 
 
+def _sanitize_key(api_key: str) -> str:
+    """Убрать пробелы/переводы строк из ключа — HTTP-заголовки идут в latin-1."""
+    return (api_key or "").strip()
+
+
 def solve_captcha_vision(
     img_bytes: bytes,
     *,
@@ -89,8 +94,15 @@ def solve_captcha_vision(
     Возвращает строку только из букв/цифр либо None при ошибке/без ключа.
     ``auth_scheme``: "bearer" (по умолчанию) или "api-key" (Yandex API-ключ).
     """
+    api_key = _sanitize_key(api_key)
     if not api_key:
         log.info("Ключ vision-модели не задан (VISION_API_KEY) — пропускаю")
+        return None
+    if not api_key.isascii():
+        log.warning(
+            "В ключе vision-модели есть не-ASCII символы (похоже, вставлен "
+            "плейсхолдер вроде '<ключ>') — проверьте VISION_API_KEY"
+        )
         return None
     if not img_bytes:
         return None
