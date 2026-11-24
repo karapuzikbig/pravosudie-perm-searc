@@ -700,12 +700,25 @@ class Scraper:
         if await inp.count() == 0:
             return False
         try:
-            await inp.fill(code)
+            # некоторые реализации проверяют код по мере ввода (oninput/onkeyup):
+            # вводим посимвольно, а не одним fill(), чтобы сработали обработчики
+            await inp.click()
+            await inp.fill("")
+            await inp.type(code, delay=80)
         except Exception:  # noqa: BLE001
-            return False
+            try:
+                await inp.fill(code)
+            except Exception:  # noqa: BLE001
+                return False
+        # запомним текущую картинку, чтобы отличить «перерисовали с новой»
+        # от «ещё ничего не произошло» при неверном коде
+        before = await self._captcha_img_src(page)
+        await asyncio.sleep(0.3)
         log.info("Пробую код капчи «%s»", code)
         await self._submit_captcha(page)
-        ok = await self._poll_until(page, lambda: self._captcha_solved(page), timeout_ms=8000)
+        # на неверный код сервер перерисовывает капчу почти сразу — короткого
+        # ожидания достаточно; долгий поллинг только замедляет перебор
+        ok = await self._poll_until(page, lambda: self._captcha_solved(page), timeout_ms=4000)
         if ok:
             # форма дел дорисовывается JS уже после капчи — дождёмся её,
             # иначе сразу после «после капчи» страница ещё пустой скелет
@@ -713,8 +726,24 @@ class Scraper:
             if dump:
                 await self._dump(page, "after_captcha")
             return True
-        log.info("Код капчи «%s» не принят", code)
+        after = await self._captcha_img_src(page)
+        if dump:
+            await self._dump(page, "captcha_rejected")
+        if before and after and before == after:
+            log.info("Код капчи «%s» не принят (картинка не обновилась)", code)
+        else:
+            log.info("Код капчи «%s» не принят (капча перерисована)", code)
         return False
+
+    async def _captcha_img_src(self, page) -> str:
+        """Текущий src картинки капчи (пустая строка, если картинки нет)."""
+        try:
+            img = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
+            if await img.count() > 0:
+                return await img.get_attribute("src") or ""
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
 
     async def _captcha_solved(self, page) -> bool:
         """Капча принята: пропало поле ввода или появилась форма дел."""
