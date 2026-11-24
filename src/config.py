@@ -84,7 +84,17 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
     raw: dict[str, Any] = {}
     if path.exists():
         with open(path, encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+            try:
+                raw = yaml.safe_load(fh) or {}
+            except yaml.YAMLError as exc:
+                where = ""
+                mark = getattr(exc, "problem_mark", None)
+                if mark is not None:
+                    where = f" (строка {mark.line + 1}, колонка {mark.column + 1})"
+                raise ValueError(
+                    f"Ошибка в {path}{where}: проверьте кавычки и отступы YAML. "
+                    f"Подробности: {exc}"
+                ) from exc
 
     scraper_raw = raw.get("scraper") or {}
     scraper = ScraperConfig(
