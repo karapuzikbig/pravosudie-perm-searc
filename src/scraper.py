@@ -1090,6 +1090,16 @@ class Scraper:
                     await inp.press("Enter")
                 except Exception:  # noqa: BLE001
                     pass
+            try:
+                value = await inp.input_value()
+            except Exception:  # noqa: BLE001
+                value = "?"
+            if not value:
+                log.warning(
+                    "Статья КоАП «%s» введена, но поле осталось пустым "
+                    "(autocomplete не выбрал значение)",
+                    article,
+                )
             return True
         except Exception:  # noqa: BLE001
             return False
