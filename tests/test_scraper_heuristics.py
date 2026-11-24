@@ -427,6 +427,62 @@ def test_auto_solve_empty_code_reloads_without_input():
     assert calls["reload"] >= 1
 
 
+def test_wait_new_captcha_detects_server_refresh_without_reload():
+    """После неверного кода сервер сам даёт новую капчу — reload не нужен."""
+    s = _scraper()
+
+    class _ImgLoc:
+        def __init__(self):
+            self._seq = [b"old", b"new", b"new"]
+
+        @property
+        def first(self):
+            return self
+
+        async def count(self):
+            return 1
+
+        async def screenshot(self):
+            return self._seq.pop(0) if len(self._seq) > 1 else self._seq[0]
+
+    class _Page:
+        def locator(self, _sel):
+            return _ImgLoc()
+
+    async def _fake_has(self, page):
+        return True
+
+    s._has_captcha = _fake_has.__get__(s)
+    got = asyncio.run(s._wait_new_captcha(_Page(), b"old", timeout_ms=3000))
+    assert got is True
+
+
+def test_wait_new_captcha_times_out_when_image_unchanged():
+    s = _scraper()
+
+    class _ImgLoc:
+        @property
+        def first(self):
+            return self
+
+        async def count(self):
+            return 1
+
+        async def screenshot(self):
+            return b"same"
+
+    class _Page:
+        def locator(self, _sel):
+            return _ImgLoc()
+
+    async def _fake_has(self, page):
+        return True
+
+    s._has_captcha = _fake_has.__get__(s)
+    got = asyncio.run(s._wait_new_captcha(_Page(), b"same", timeout_ms=600))
+    assert got is False
+
+
 def test_extract_schedule_date_from_h_date():
     from src.scraper import _extract_schedule_date
 

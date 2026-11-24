@@ -874,10 +874,34 @@ class Scraper:
             # это и приводило к тому, что в новое поле уходил старый код.
             if await self._try_captcha_code(page, code, dump):
                 return True
-            log.info("Капча не принята (код «%s», %s), обновляем картинку", code, source)
+            log.info("Капча не принята (код «%s», %s), ждём новую картинку", code, source)
             local_failures += 1
-            await self._reload_captcha(page)
+            # После неверного кода сервер сам перерисовывает капчу — картинка
+            # уже новая. Не перезагружаем страницу вслепую (это давало двойное
+            # обновление); дождаёмся смены картинки и reload только по таймауту.
+            if not await self._wait_new_captcha(page, img_bytes, timeout_ms=5000):
+                await self._reload_captcha(page)
             self._pause()
+        return False
+
+    async def _wait_new_captcha(self, page, prev_bytes: bytes, timeout_ms: int) -> bool:
+        """Дождаться, что сервер уже отдал новую картинку капчи после ошибки.
+
+        Возвращает True, если байты картинки сменились относительно ``prev_bytes``
+        (сервер отрисовал новую капчу сам). False — по таймауту.
+        """
+        img_loc = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            if await self._has_captcha(page):
+                try:
+                    if await img_loc.count() > 0:
+                        current = await self._fetch_captcha_image(page, img_loc)
+                        if current and current != prev_bytes:
+                            return True
+                except Exception:  # noqa: BLE001
+                    pass
+            await asyncio.sleep(0.4)
         return False
 
     def _save_captcha_image(self, img_bytes: bytes, attempt: int) -> None:
