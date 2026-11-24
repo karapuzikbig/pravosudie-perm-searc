@@ -715,8 +715,9 @@ class Scraper:
                 for cand in self._vision_ocr(img_bytes):
                     if await self._try_captcha_code(page, cand, dump):
                         return True
-                # vision не помог — одна неудачная попытка, идём дальше
+                # vision не помог — одна неудачная попытка, обновляем капчу
                 local_failures += 1
+                await self._reload_captcha(page)
                 self._pause()
                 continue
             if not code:
@@ -730,6 +731,7 @@ class Scraper:
                 return True
             log.info("Капча не принята (код «%s», %s), пробуем снова", code, source)
             local_failures += 1
+            await self._reload_captcha(page)
             self._pause()
         return False
 
@@ -839,10 +841,21 @@ class Scraper:
     async def _fetch_captcha_image(self, page, img_loc) -> bytes:
         """Получить PNG/JPEG байты картинки капчи.
 
-        Предпочтительно скачать по src через контекст запросов браузера —
-        так не теряется резкость из-за масштабирования элемента. Если не
-        удалось — снимаем скриншот самого элемента.
+        KCAPTCHA отдаётся по одному и тому же URL (``captcha.php``). Если
+        скачивать её отдельным запросом через контекст браузера, можно
+        получить **закешированную** копию прежней капчи — и тогда OCR снова
+        и снова распознаёт старую картинку (коды «переиспользуются»).
+
+        Поэтому основной путь — скриншот самого элемента: он всегда
+        показывает то, что реально отрисовано в браузере сейчас. Запасной
+        путь — запрос по src с cache-bust и без кеша.
         """
+        try:
+            shot = await img_loc.screenshot()
+            if shot:
+                return shot
+        except Exception:  # noqa: BLE001
+            pass
         src = None
         try:
             src = await img_loc.get_attribute("src")
@@ -853,14 +866,16 @@ class Scraper:
                 from urllib.parse import urljoin  # noqa: PLC0415
 
                 url = urljoin(page.url, src)
-                resp = await page.context.request.get(url)
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}_ts={int(time.time() * 1000)}"
+                resp = await page.context.request.get(url, headers={"Cache-Control": "no-cache"})
                 if resp.ok:
                     data = await resp.body()
                     if data:
                         return data
             except Exception:  # noqa: BLE001
                 pass
-        return await img_loc.screenshot()
+        raise RuntimeError("Не удалось получить картинку капчи")
 
     async def _submit_captcha(self, page) -> None:
         form = page.locator("#kcaptchaForm").first
@@ -952,17 +967,35 @@ class Scraper:
         return False
 
     async def _reload_captcha(self, page) -> None:
-        """Обновить картинку капчи (клик по ней или перезагрузка страницы)."""
+        """Гарантированно сменить картинку капчи перед новой попыткой.
+
+        Если картинка не обновилась, слать новый код бессмысленно: сервер
+        проверит его против прежней капчи. Поэтому кликаем по картинке и
+        проверяем, что байты изменились; если нет — принудительно
+        перезагружаем страницу.
+        """
         img_loc = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
+        if await img_loc.count() == 0:
+            return
         try:
-            if await img_loc.count() > 0:
-                await img_loc.click()
-                await asyncio.sleep(0.5)
-                return
+            before = await self._fetch_captcha_image(page, img_loc)
+        except Exception:  # noqa: BLE001
+            before = b""
+        try:
+            await img_loc.click()
+            await asyncio.sleep(0.8)
         except Exception:  # noqa: BLE001
             pass
         try:
+            after = await self._fetch_captcha_image(page, img_loc)
+        except Exception:  # noqa: BLE001
+            after = b""
+        if after and after != before:
+            return
+        # клик не поменял капчу — перезагружаем страницу (повторно появляется новая)
+        try:
             await page.reload(wait_until="domcontentloaded")
+            await asyncio.sleep(0.5)
         except Exception:  # noqa: BLE001
             pass
 
