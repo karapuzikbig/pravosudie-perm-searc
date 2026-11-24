@@ -580,7 +580,6 @@ class Scraper:
         vision_allowed = self.cfg.captcha_vision_enabled and bool(vision_key)
 
         attempts = max(1, self.cfg.captcha_max_attempts)
-        local_failures = 0
         for attempt in range(1, attempts + 1):
             img_loc = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
             if await img_loc.count() == 0:
@@ -593,28 +592,33 @@ class Scraper:
             except Exception:  # noqa: BLE001
                 return False
 
-            code = ""
+            # Для OДНОЙ картинки перебираем сначала код локального OCR, затем
+            # коды vision. Как только попытка отправлена (принята или нет),
+            # картинка устаревает — сервер при ошибке рисует новую капчу.
+            # Поэтому следующий кандидат проверяем уже на новой картинке,
+            # а не шлём коды, снятые со старой.
+            cands: list[str] = []
             if ocr is not None:
-                code = self._local_ocr(ocr, img_bytes, attempt, attempts)
-            if code and await self._try_captcha_code(page, code, dump):
-                return True
-            if code:
-                log.info("Капча не принята (код «%s», ocr), пробуем снова", code)
-                local_failures += 1
-            # локальный OCR пуст или не принят — спрашиваем vision-модель
+                ocr_code = self._local_ocr(ocr, img_bytes, attempt, attempts)
+                if ocr_code:
+                    cands.append(ocr_code)
             if vision_allowed:
                 for cand in self._vision_ocr(img_bytes):
-                    if cand == code:
-                        continue
-                    if await self._try_captcha_code(page, cand, dump):
-                        return True
-                log.info("Vision-варианты не приняты, пробуем снова")
-            if not code and ocr is not None:
-                local_failures += 1
-            if not code and not vision_allowed:
-                # локальный OCR пуст и vision недоступен — перерисовать капчу
+                    if cand not in cands:
+                        cands.append(cand)
+            if not cands:
+                # ничего не распознали — перерисовать капчу и пробовать снова
                 await self._reload_captcha(page)
+                self._pause()
                 continue
+
+            code = cands[0]
+            accepted = await self._try_captcha_code(page, code, dump)
+            if accepted:
+                return True
+            if len(cands) > 1:
+                # сервер уже показал новую капчу — старые коды к ней не подходят
+                log.info("Капча не принята (код «%s»); остальные варианты устарели", code)
             self._pause()
         return False
 
@@ -665,7 +669,13 @@ class Scraper:
         return variants
 
     async def _try_captcha_code(self, page, code: str, dump: bool) -> bool:
-        """Ввести код капчи, отправить и проверить, принят ли."""
+        """Ввести код капчи, отправить и проверить, принят ли.
+
+        Успех — это когда пропало ПОЛЕ капчи (или появилась форма дел), а не
+        когда «форма исчезла»: при oшибочном коде kcaptcha не убирает форму,
+        а перерисовывает её с новой картинкой и сообщением об ошибке. Старая
+        проверка «форма исчезла» не отличала перерисовку от успеха.
+        """
         if not code:
             return False
         inp = page.locator('input[name="captcha-response"]').first
@@ -677,7 +687,7 @@ class Scraper:
             return False
         log.info("Пробую код капчи «%s»", code)
         await self._submit_captcha(page)
-        ok = await self._wait_captcha_gone(page, timeout_ms=8000)
+        ok = await self._poll_until(page, lambda: self._captcha_solved(page), timeout_ms=8000)
         if ok:
             # форма дел дорисовывается JS уже после капчи — дождёмся её,
             # иначе сразу после «после капчи» страница ещё пустой скелет
@@ -688,43 +698,53 @@ class Scraper:
         log.info("Код капчи «%s» не принят", code)
         return False
 
-    async def _fetch_captcha_image(self, page, img_loc) -> bytes:
-        """Получить PNG/JPEG байты картинки капчи.
-
-        Предпочтительно скачать по src через контекст запросов браузера —
-        так не теряется резкость из-за масштабирования элемента. Если не
-        удалось — снимаем скриншот самого элемента.
-        """
-        src = None
+    async def _captcha_solved(self, page) -> bool:
+        """Капча принята: пропало поле ввода или появилась форма дел."""
         try:
-            src = await img_loc.get_attribute("src")
+            if await page.locator('input[name="captcha-response"]').count() == 0:
+                return True
         except Exception:  # noqa: BLE001
-            src = None
-        if src:
-            try:
-                from urllib.parse import urljoin  # noqa: PLC0415
+            pass
+        return await self._case_form_ready(page)
 
-                url = urljoin(page.url, src)
-                resp = await page.context.request.get(url)
-                if resp.ok:
-                    data = await resp.body()
-                    if data:
-                        return data
-            except Exception:  # noqa: BLE001
-                pass
+    async def _fetch_captcha_image(self, page, img_loc) -> bytes:
+        """Получить байты именно той картинки капчи, что показана в форме.
+
+        Нельзя скачивать ``/captcha.php`` отдельным запросом: для kcaptcha
+        сервер держит картинку в сессии и на новый запрос может отдать
+        ДРУГУЮ капчу, не совпадающую с той, что в ``<img>`` на странице.
+        Тогда распознанный код относится не к той картинке, которую проверят,
+        и верный ответ всё равно отвергается. Поэтому снимаем скриншот самого
+        элемента — это гарантированно то, что видит пользователь.
+        """
         return await img_loc.screenshot()
 
     async def _submit_captcha(self, page) -> None:
+        """Отправить введённый код кнопкой «Продолжить» внутри формы капчи.
+
+        Нельзя кликать «первую попавшуюся кнопку»: в форме/рядом может быть
+        кнопка обновления капчи — клик по ней лишь меняет картинку и не
+        отправляет код.
+        """
         form = page.locator("#kcaptchaForm").first
         if await form.count() > 0:
-            for sel in ('input[type="submit"]', 'button[type="submit"]', "button"):
-                btn = form.locator(sel).first
-                try:
-                    if await btn.count() > 0:
-                        await btn.click()
-                        return
-                except Exception:  # noqa: BLE001
-                    continue
+            # сначала — кнопка с текстом «Продолжить» именно внутри формы
+            try:
+                btn = form.get_by_role("button", name="Продолжить").first
+                if await btn.count() > 0:
+                    await btn.click()
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                btn = form.get_by_role("button", name="Продолжить").first
+                if await btn.count() == 0:
+                    btn = form.locator('input[type="submit"]').first
+                if await btn.count() > 0:
+                    await btn.click()
+                    return
+            except Exception:  # noqa: BLE001
+                pass
         # запасной путь: Enter в поле
         inp = page.locator('input[name="captcha-response"]').first
         try:
@@ -733,7 +753,7 @@ class Scraper:
                 return
         except Exception:  # noqa: BLE001
             pass
-        # последняя надежда — любая кнопка «Продолжить»
+        # последняя надежда — кнопка «Продолжить» на странице
         try:
             await page.get_by_role("button", name="Продолжить").first.click()
         except Exception:  # noqa: BLE001

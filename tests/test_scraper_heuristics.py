@@ -256,4 +256,57 @@ def test_wait_for_case_form_returns_false_on_empty_skeleton():
     assert ok is False
 
 
+def test_captcha_solved_true_when_input_gone():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(0 if sel == 'input[name="captcha-response"]' else 0)
+
+    assert asyncio.run(s._captcha_solved(_Page())) is True
+
+
+def test_captcha_solved_true_when_case_form_present():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            if sel == 'input[name="captcha-response"]':
+                return _Loc(1)
+            return _Loc(1 if sel in ("#bookmark_type_2", "li#type_2") else 0)
+
+    assert asyncio.run(s._captcha_solved(_Page())) is True
+
+
+def test_captcha_solved_false_when_input_still_there_and_no_form():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(1 if sel == 'input[name="captcha-response"]' else 0)
+
+    assert asyncio.run(s._captcha_solved(_Page())) is False
+
+
 
