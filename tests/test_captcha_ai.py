@@ -16,8 +16,9 @@ def test_extract_code_skips_noise_words():
     assert extract_code("На картинке капча, код: сноп") == "сноп"
 
 
-def test_extract_code_mixed_cyrillic_latin():
-    assert extract_code("Ответ: кот12") == "кот12"
+def test_extract_code_strips_digits():
+    # цифр в капче нет — они отбрасываются
+    assert extract_code("Ответ: кот12") == "кот"
 
 
 def test_extract_code_fallback_strips_to_allowed():
@@ -28,3 +29,9 @@ def test_extract_code_fallback_strips_to_allowed():
 def test_extract_code_empty():
     assert extract_code("") == ""
     assert extract_code(None) == ""
+
+
+def test_extract_code_transliterates_latin():
+    # модель ответила латиницей — переводим в кириллицу
+    assert extract_code("nacpyxTa") == "пасрухта"
+    assert extract_code("moшашр") == "мошашр"

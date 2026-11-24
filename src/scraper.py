@@ -78,8 +78,15 @@ class CaptchaDetected(RuntimeError):
 
 
 def _clean_ocr_code(raw: str | None) -> str:
-    """Оставить в распознанном коде капчи только буквы и цифры."""
-    return "".join(ch for ch in (raw or "") if ch.isalnum())
+    """Оставить в коде капчи только русские строчные буквы (без цифр).
+
+    Капча портала состоит только из строчных русских букв. ddddocr отвечает
+    латиницей (свой алфавит), поэтому латинские буквы-двойники переводим в
+    кириллицу, а цифры, знаки и прочее отбрасываем.
+    """
+    from .captcha_ai import _to_cyrillic_lower  # noqa: PLC0415
+
+    return _to_cyrillic_lower(raw or "")
 
 
 def _html_has_captcha(html: str | None) -> bool:
@@ -569,8 +576,15 @@ class Scraper:
         ocr = None
         try:
             import ddddocr  # noqa: PLC0415
+            from ddddocr import charsets  # noqa: PLC0415
 
+            # ddddocr умеет только латиницу/знаки. Капча же — одни русские
+            # буквы, поэтому ограничиваем алфавит латиницей (её затем переводим
+            # в кириллицу) — модель перестанет лепить цифры и прочий мусор.
             ocr = ddddocr.DdddOcr(show_ad=False)
+            latin = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            if all(ch in charsets.CHARSET_OLD for ch in latin):
+                ocr.ocr_engine.set_charset_range(latin)
         except Exception:  # noqa: BLE001
             log.info("ddddocr недоступен — полагаемся на vision-модель")
         if not await self._has_captcha(page):
@@ -661,12 +675,9 @@ class Scraper:
         )
         if not code:
             return []
-        # Капча — строчные русские буквы. Пробуем код как есть и в нижнем
-        # регистре (на случай заглавных от модели); верхний регистр не нужен.
-        variants = [code]
-        if code.lower() != code:
-            variants.append(code.lower())
-        return variants
+        # solve_captcha_vision уже отдаёт строку только из русских строчных
+        # букв (цифры и латиница преобразованы/убраны) — вариант один.
+        return [code]
 
     async def _try_captcha_code(self, page, code: str, dump: bool) -> bool:
         """Ввести код капчи, отправить и проверить, принят ли.

@@ -149,10 +149,13 @@ def test_collect_precinct_urls_drops_portal_and_bare_msudrf():
     assert urls == ["http://5.perm.msudrf.ru/modules.php?name=sud_delo"]
 
 
-def test_clean_ocr_code_keeps_alnum():
+def test_clean_ocr_code_keeps_only_cyrillic_lower():
     from src.scraper import _clean_ocr_code
 
-    assert _clean_ocr_code(" aB-c1 2! ") == "aBc12"
+    # латиница-двойники → кириллица, цифры и знаки выкидываем
+    assert _clean_ocr_code(" aB-c1 2! ") == "авс"
+    assert _clean_ocr_code("mowwaup") == "мошшаир"
+    assert _clean_ocr_code("Кот12") == "кот"
     assert _clean_ocr_code(None) == ""
     assert _clean_ocr_code("") == ""
 
@@ -172,9 +175,9 @@ def test_html_has_captcha_by_structure():
 def test_vote_codes_picks_most_frequent_then_longest():
     from src.scraper import _vote_codes
 
-    assert _vote_codes(["abcd", "abcf", "abcd"]) == "abcd"
-    assert _vote_codes(["abc", "ab", "abc"]) == "abc"
-    assert _vote_codes(["", None, "xy"]) == "xy"
+    assert _vote_codes(["котш", "котп", "котш"]) == "котш"
+    assert _vote_codes(["кот", "ко", "кот"]) == "кот"
+    assert _vote_codes(["", None, "ха"]) == "ха"
     assert _vote_codes([]) == ""
 
 
