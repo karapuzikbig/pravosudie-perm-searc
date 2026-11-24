@@ -429,7 +429,13 @@ class Scraper:
                         for case in matching:
                             collected.setdefault(case.uid, case)
                         log.info(
-                            "Стр. %d: дел=%d, новых в Excel=%d", page_no, len(matching), added
+                            "Стр. %d: разобрано=%d, прошло по статьям=%d, "
+                            "новых в Excel=%d (статьи=%s)",
+                            page_no,
+                            len(cases),
+                            len(matching),
+                            added,
+                            wanted,
                         )
                         if not await self._goto_next_page(page):
                             break

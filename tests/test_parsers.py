@@ -150,3 +150,19 @@ def test_dedup_key_distinguishes_hearings():
     assert a.dedup_key != b.dedup_key
     same = Case(case_number="5-1/2025", article="12.8", hearing=Hearing(raw="12.03.2025 14:30"))
     assert a.dedup_key == same.dedup_key
+
+
+def test_parse_table_without_th_headers():
+    # Заголовки в <td> (без <th>) — не должны мешать разбору строк с делами.
+    html = (
+        "<table>"
+        "<tr><td>Номер дела</td><td>Время слушания</td><td>Информация по делу</td><td>Судья</td></tr>"
+        "<tr><td>5-724/2026</td><td>10:15</td>"
+        "<td>ПРАВОНАРУШЕНИЕ: Вертягин - ст. 12.8 ч. 1;</td><td>Шабалина</td></tr>"
+        "</table>"
+    )
+    cases = parse_case_html(html)
+    assert len(cases) == 1
+    assert cases[0].case_number == "5-724/2026"
+    assert cases[0].article == "12.8"
+    assert cases[0].hearing.time_str == "10:15"

@@ -232,17 +232,30 @@ def parse_case_html(html: str, url: str = "") -> list[Case]:
     # 1) табличный вариант выдачи
     for table in soup.find_all("table"):
         headers = [_clean(th.get_text()) for th in table.find_all("th")]
-        if not headers:
-            continue
-        for row in table.find_all("tr"):
-            cells = row.find_all("td")
-            if not cells:
-                continue
-            cell_texts = [_clean(c.get_text(" ", strip=True)) for c in cells]
-            row_text = _clean(" ".join(cell_texts))
-            case = _case_from_row(headers, cell_texts, row_text, _row_link(row, url) or url)
-            if case:
-                cases.append(case)
+        if headers:
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+                if not cells:
+                    continue
+                cell_texts = [_clean(c.get_text(" ", strip=True)) for c in cells]
+                row_text = _clean(" ".join(cell_texts))
+                case = _case_from_row(
+                    headers, cell_texts, row_text, _row_link(row, url) or url
+                )
+                if case:
+                    cases.append(case)
+        else:
+            # Таблица без <th>: строки-заголовки среди <td> игнорируем,
+            # данные берём из тех строк, где есть номер дела/статья.
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+                if not cells:
+                    continue
+                cell_texts = [_clean(c.get_text(" ", strip=True)) for c in cells]
+                row_text = _clean(" ".join(cell_texts))
+                case = _case_from_row([], cell_texts, row_text, _row_link(row, url) or url)
+                if case:
+                    cases.append(case)
         if cases:
             return cases
 
