@@ -34,7 +34,14 @@ from pathlib import Path
 
 from .config import BASE_DIR, ScraperConfig, Settings
 from .excel_export import append_cases
-from .parsers import Case, has_cases_table, parse_case_html, parse_date
+from .parsers import (
+    Case,
+    has_cases_table,
+    has_schedule_module,
+    parse_case_html,
+    parse_date,
+    schedule_has_no_hearings,
+)
 
 log = logging.getLogger(__name__)
 
@@ -432,11 +439,18 @@ class Scraper:
                         if html is None:
                             break
                         if not has_cases_table(html):
-                            log.info(
-                                "На %s (стр. %d) нет таблицы дел — пропускаем",
-                                site_url,
-                                page_no,
-                            )
+                            if schedule_has_no_hearings(html):
+                                log.info(
+                                    "На %s (стр. %d): дел на дату не назначено",
+                                    site_url,
+                                    page_no,
+                                )
+                            else:
+                                log.info(
+                                    "На %s (стр. %d) нет таблицы дел — пропускаем",
+                                    site_url,
+                                    page_no,
+                                )
                             break
                         cases = parse_case_html(html, url=page.url)
                         # В «Списке дел на день» дата заседания — не в строке,
@@ -723,6 +737,19 @@ class Scraper:
                     return True
             except Exception:  # noqa: BLE001
                 pass
+        # Модуль расписания открылся, но на выбранную дату дел нет: таблицы и
+        # формы нет, зато есть поле даты (name="H_date"), #search_results и
+        # «на дату слушаний не назначено». Это валидная страница участка с 0
+        # дел, а не «не нашли форму».
+        try:
+            html = await page.content()
+            if has_schedule_module(html):
+                log.info(
+                    "Модуль расписания открыт на %s (дел на дату нет)", site_url
+                )
+                return True
+        except Exception:  # noqa: BLE001
+            pass
         if dump:
             await self._dump(page, "site_no_form")
         return False

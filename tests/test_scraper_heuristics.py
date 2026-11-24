@@ -488,3 +488,80 @@ def test_open_case_search_after_captcha_reads_ready_list():
 
     ok = asyncio.run(s._open_case_search_on_site(page, "http://5.perm.msudrf.ru", dump=False))
     assert ok is True
+
+
+SCHEDULE_EMPTY_HTML = """
+<html><body>
+<ul class="bookmarks">
+  <li id="schedule" class="active"><a href="#">Расписание слушаний дел</a></li>
+  <li id="type_0"><a href="#">Гражданские дела</a></li>
+  <li id="type_2"><a href="#">Дела об административных правонарушениях</a></li>
+</ul>
+<div id="bookmark_schedule">
+  <input type="text" class="date-picker" name="H_date" value="24.11.2026" id="dp1">
+  <input type="button" value="Показать" id="btnShow">
+</div>
+<div id="search_results">
+  <div class="search-error">На 24.11.2026 слушаний дел не назначено.<br></div>
+</div>
+<div id="button_block" style="display:none"></div>
+</body></html>
+"""
+
+
+def test_schedule_module_helpers_detect_empty_day():
+    from src.parsers import has_schedule_module, schedule_has_no_hearings
+
+    assert has_schedule_module(SCHEDULE_EMPTY_HTML) is True
+    assert schedule_has_no_hearings(SCHEDULE_EMPTY_HTML) is True
+    # страница без модуля расписания и без пометки «не назначено»
+    assert has_schedule_module("<html><body>403 Доступ запрещен</body></html>") is False
+    assert schedule_has_no_hearings("<html><body>403 Доступ запрещен</body></html>") is False
+
+
+def test_open_case_search_accepts_schedule_page_without_cases():
+    """Страница расписания без дел на дату — валидна (не «не нашли форму»).
+
+    Регрессия: на участке без слушаний нет ни формы дел, ни таблицы, но есть
+    модуль расписания (H_date / #search_results / .search-error). Такой участок
+    нужно считать обработанным с 0 дел, а не пропускать.
+    """
+    s = _scraper()
+    s._pause = lambda: None
+
+    class _Loc:
+        async def count(self):
+            return 0
+
+    class _Page:
+        url = "http://3.perm.msudrf.ru/modules.php?name=sud_delo&op=hl"
+
+        async def goto(self, *_a, **_k):
+            return None
+
+        async def content(self):
+            return SCHEDULE_EMPTY_HTML
+
+        def locator(self, _sel):
+            return _Loc()
+
+    async def fake_open_site(_page, _url, _dump):
+        return True
+
+    s._open_site_with_retry = fake_open_site
+    s._has_captcha = lambda _p: _false()
+    s._is_blocked = lambda _p: _false()
+    s._recover_from_500 = lambda _p, _k: _true()
+    s._click_link_texts = lambda _p, _t: _false()
+    s._wait_captcha_gone = lambda _p, timeout_ms=15000: _true()
+
+    ok = asyncio.run(s._open_case_search_on_site(_Page(), "http://3.perm.msudrf.ru", dump=False))
+    assert ok is True
+
+
+async def _false():
+    return False
+
+
+async def _true():
+    return True

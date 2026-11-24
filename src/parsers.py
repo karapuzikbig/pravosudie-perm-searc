@@ -219,6 +219,35 @@ def has_cases_table(html: str) -> bool:
     return False
 
 
+def has_schedule_module(html: str) -> bool:
+    """Это страница расписания дел участка (даже если дел на дату нет).
+
+    Модуль ``op=hl`` отдаёт «Расписание слушаний дел» с полем даты
+    (``name="H_date"``), контейнером ``#search_results`` и вкладками. Такую
+    страницу нужно принимать как валидный источник: пустой результат
+    («на дату слушаний не назначено») — не ошибка открытия участка.
+    """
+    if not html:
+        return False
+    low = html.lower()
+    return (
+        'name="h_date"' in low
+        or 'id="search_results"' in low
+        or 'id="bookmark_schedule"' in low
+    )
+
+
+def schedule_has_no_hearings(html: str) -> bool:
+    """На странице расписания явно указано, что дел на дату не назначено."""
+    if not html:
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    err = soup.select_one(".search-error")
+    if err and "не назначено" in _clean(err.get_text(" ", strip=True)).lower():
+        return True
+    return "слушаний дел не назначено" in _clean(html).lower()
+
+
 def parse_case_html(html: str, url: str = "") -> list[Case]:
     """Разобрать страницу со списком/карточками дел.
 
