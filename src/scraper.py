@@ -198,6 +198,42 @@ class Scraper:
             log.exception("Не удалось сохранить HTML")
         await self._screenshot(page, tag)
 
+    async def _dump_text(self, page, tag: str) -> None:
+        """Сохранить компактное текстовое содержимое формы дел.
+
+        Большой HTML форума неудобно пересылать; здесь — выжимка: заголовки,
+        строки таблиц и ссылки вкладки административных дел и #search_results,
+        чтобы можно было без скриншотов понять структуру результатов.
+        """
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self.logs_dir / f"{tag}_{ts}.txt"
+        try:
+            lines = await page.evaluate(
+                """() => {
+                    const out = [];
+                    const root = document.querySelector('#bookmark_type_2')
+                        || document.querySelector('#search_results')
+                        || document.body;
+                    if (!root) return out;
+                    root.querySelectorAll('h1,h2,h3,h4,th,td,a,tr').forEach((el) => {
+                        const t = (el.innerText || el.textContent || '').trim()
+                            .replace(/\\s+/g, ' ');
+                        if (!t) return;
+                        if (el.tagName === 'A') {
+                            out.push('A[' + (el.getAttribute('href') || '') + '] ' + t);
+                        } else {
+                            out.push(el.tagName + ': ' + t);
+                        }
+                    });
+                    return out;
+                }"""
+            )
+            text = "\n".join(lines) if lines else "(пусто)"
+            path.write_text(text, encoding="utf-8")
+            log.info("Текст результатов сохранён: %s (%d строк)", path, len(lines))
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось сохранить текст результатов")
+
     def _date_window(self) -> str:
         today = datetime.now()
         date_from = today - timedelta(days=self.settings.lookback_days)
@@ -286,6 +322,7 @@ class Scraper:
                         continue
                     if dump:
                         await self._dump(page, f"after_submit_{idx:02d}")
+                        await self._dump_text(page, f"after_submit_{idx:02d}")
                     for _ in range(self.cfg.max_pages):
                         if await self._has_captcha(page):
                             await self._pass_captcha(page, dump)
