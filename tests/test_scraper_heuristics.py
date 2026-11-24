@@ -435,3 +435,56 @@ def test_extract_schedule_date_from_h_date():
     assert d is not None and d.day == 24 and d.month == 11 and d.year == 2026
     assert _extract_schedule_date("<html>без даты</html>") is None
     assert _extract_schedule_date("") is None
+
+
+def test_open_case_search_after_captcha_reads_ready_list():
+    """После решения капчи готовый список дел принимается (не «не открылся»).
+
+    Регрессия: раньше `await self._pause()` (синхронный метод) бросал
+    TypeError сразу после капчи, и участок с готовым списком пропускался.
+    """
+    s = _scraper()
+    s._pause = lambda: None
+
+    listed_html = (
+        "<table><tr><td>5-724/2026</td><td>ст. 12.8 ч. 1</td></tr></table>"
+    )
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def __init__(self):
+            self.url = "http://5.perm.msudrf.ru/modules.php?name=sud_delo&op=hl"
+            self._captcha = True
+
+        async def goto(self, *_a, **_k):
+            self._captcha = False
+
+        async def content(self):
+            return listed_html
+
+        def locator(self, _sel):
+            return _Loc(1 if self._captcha else 0)
+
+    page = _Page()
+
+    async def fake_open_site(_page, _url, _dump):
+        return True
+
+    async def fake_pass_captcha(_page, _dump):
+        page._captcha = False
+
+    async def fake_wait_gone(_page, timeout_ms=15000):
+        return True
+
+    s._open_site_with_retry = fake_open_site
+    s._pass_captcha = fake_pass_captcha
+    s._wait_captcha_gone = fake_wait_gone
+
+    ok = asyncio.run(s._open_case_search_on_site(page, "http://5.perm.msudrf.ru", dump=False))
+    assert ok is True

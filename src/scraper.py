@@ -674,7 +674,7 @@ class Scraper:
                     break
                 log.warning("Не открылся модуль дел на %s (попытка %d): %s", site_url, gtry, exc)
                 self._pause()
-        if not goto_ok and last_exc is not None and "delo_url" not in page.url:
+        if not goto_ok and last_exc is not None and "name=sud_delo" not in page.url:
             # если не удалось и на странице нет капчи/результатов — сдаёмся
             if not await self._has_captcha(page):
                 try:
@@ -692,6 +692,13 @@ class Scraper:
         # модуль может сразу выдать капчу («дополнительную проверку»)
         if await self._has_captcha(page):
             await self._pass_captcha(page, dump)
+            # после решения капчи страница отрисовывается не мгновенно:
+            # дождёмся, пока уйдёт капча или появится форма/таблица, иначе
+            # примем промежуточный DOM за «не открылся».
+            try:
+                await self._wait_captcha_gone(page, timeout_ms=15000)
+            except Exception:  # noqa: BLE001
+                pass
         if await self._page_has_form(page):
             return True
         # Некоторые участки отдают сразу готовый «Список дел, назначенных к
@@ -703,7 +710,7 @@ class Scraper:
                 return True
         except Exception:  # noqa: BLE001
             pass
-        await self._pause()
+        self._pause()
         if await self._click_link_texts(
             page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
         ):
