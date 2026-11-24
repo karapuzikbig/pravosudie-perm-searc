@@ -128,3 +128,78 @@ def solve_captcha_vision(
         return None
     log.info("Vision-модель распознала капчу: «%s»", code)
     return code
+
+
+def probe_vision(
+    img_bytes: bytes,
+    *,
+    api_key: str,
+    model: str,
+    base_url: str = "https://llm.api.cloud.yandex.net/v1",
+    auth_scheme: str = "api-key",
+    folder_id: str = "",
+    timeout: float = 30.0,
+) -> None:
+    """Отправить капчу в модель и напечатать СЫРОЙ ответ/ошибку (для отладки)."""
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 20,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+    }
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": (
+            f"Api-Key {api_key}" if auth_scheme == "api-key" else f"Bearer {api_key}"
+        ),
+    }
+    if folder_id:
+        headers["x-folder-id"] = folder_id
+    data = json.dumps(payload).encode("utf-8")
+    print("URL:", url)
+    print("model:", model, "| auth:", auth_scheme, "| folder:", folder_id or "-")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            print("HTTP", resp.status)
+            print(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        print("HTTP ERROR", exc.code, exc.reason)
+        try:
+            print(exc.read().decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as exc:  # noqa: BLE001
+        print("ERROR:", exc)
+
+
+if __name__ == "__main__":
+    import sys  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    if len(sys.argv) < 2:
+        print("usage: python -m src.captcha_ai <captcha.png>")
+        raise SystemExit(2)
+    import os  # noqa: PLC0415
+
+    probe_vision(
+        Path(sys.argv[1]).read_bytes(),
+        api_key=os.getenv("VISION_API_KEY", "") or os.getenv("OPENAI_API_KEY", ""),
+        model=os.getenv("VISION_MODEL", ""),
+        base_url=os.getenv("VISION_BASE_URL", "https://llm.api.cloud.yandex.net/v1"),
+        auth_scheme=os.getenv("VISION_AUTH_SCHEME", "api-key"),
+        folder_id=os.getenv("YANDEX_FOLDER_ID", ""),
+    )
