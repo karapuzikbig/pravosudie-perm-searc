@@ -188,6 +188,12 @@ def test_prepare_captcha_variants_degrades_on_bad_bytes():
     assert variants == [b"not-an-image"]
 
 
+def test_clean_captcha_for_vision_degrades_on_bad_bytes():
+    from src.scraper import _clean_captcha_for_vision
+
+    assert _clean_captcha_for_vision(b"not-an-image") == b"not-an-image"
+
+
 def test_vision_solver_no_key_returns_none():
     from src.captcha_ai import solve_captcha_vision
 

@@ -178,6 +178,44 @@ def _prepare_captcha_variants(img_bytes: bytes) -> list[bytes]:
     return variants or [img_bytes]
 
 
+def _clean_captcha_for_vision(img_bytes: bytes) -> bytes:
+    """Подготовить картинку KCAPTCHA для vision-модели.
+
+    KCAPTCHA рисует буквы с синусоидальными волнами, линиями-помехами и
+    цветным фоном — на сырой картинке vision-модель читает плохо. Убираем
+    волны/линии морфологией, выравниваем фон и увеличиваем контраст, чтобы
+    модель видела чёткие тёмные буквы на белом. Возвращает PNG; при
+    отсутствии OpenCV — исходные байты.
+    """
+    try:
+        import cv2  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return img_bytes
+
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return img_bytes
+
+    # апскейл: мелкий шрифт KCAPTCHA модели разбирать тяжело
+    up = cv2.resize(img, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+    # Оцу: буквы становятся чёрными на белом
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # волны/линии тоньше штрихов букв: «открытие» вертикальной/горизонтальной
+    # морфологией удаляет тонкие помехи, сохраняя буквы
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    # если после очистки почти пусто — остаёмся на исходной бинаризации
+    dark_ratio = float((opened < 128).mean()) if opened.size else 0.0
+    cleaned = opened if 0.01 < dark_ratio < 0.5 else binary
+    inv = cv2.bitwise_not(cleaned)
+
+    ok, buf = cv2.imencode(".png", inv)
+    return buf.tobytes() if ok else img_bytes
+
+
 def _vote_codes(codes: list[str]) -> str:
     """Выбрать самый частый код среди прочтений (по среднему при равенстве).
 
@@ -719,29 +757,61 @@ class Scraper:
         return code
 
     def _vision_ocr(self, img_bytes: bytes) -> list[str]:
-        """Спросить vision-модель; вернуть список кандидатов (возможно пустой)."""
+        """Спросить vision-модель; вернуть список кандидатов (возможно пустой).
+
+        Модель ошибается на отдельных буквах, поэтому опрашиваем её на
+        нескольких вариантах картинки (оригинал + очищенная KCAPTCHA) и
+        принимаем решение голосованием. Возвращаем кандидатов по убыванию
+        «уверенности» — сначала самый частый ответ.
+        """
         try:
             from .captcha_ai import solve_captcha_vision  # noqa: PLC0415
         except Exception:  # noqa: BLE001
             return []
-        code = solve_captcha_vision(
-            img_bytes,
-            api_key=getattr(self.settings, "vision_api_key", ""),
-            model=self.cfg.captcha_vision_model,
-            base_url=self.cfg.captcha_vision_base_url,
-            auth_scheme=self.cfg.captcha_vision_auth_scheme,
-            folder_id=self.cfg.captcha_vision_folder_id,
-            max_tokens=self.cfg.captcha_vision_max_tokens,
-            reasoning_effort=self.cfg.captcha_vision_reasoning_effort,
-        )
-        if not code:
+
+        imgs = [img_bytes]
+        cleaned = _clean_captcha_for_vision(img_bytes)
+        if cleaned and cleaned != img_bytes:
+            imgs.append(cleaned)
+
+        readings: list[str] = []
+        for data in imgs:
+            code = solve_captcha_vision(
+                data,
+                api_key=getattr(self.settings, "vision_api_key", ""),
+                model=self.cfg.captcha_vision_model,
+                base_url=self.cfg.captcha_vision_base_url,
+                auth_scheme=self.cfg.captcha_vision_auth_scheme,
+                folder_id=self.cfg.captcha_vision_folder_id,
+                max_tokens=self.cfg.captcha_vision_max_tokens,
+                reasoning_effort=self.cfg.captcha_vision_reasoning_effort,
+            )
+            if code:
+                readings.append(code)
+
+        if not readings:
             return []
-        # иногда модели возвращают и заглавные, и в нижнем регистре — пробуем оба
-        variants = [code]
-        if code.lower() != code:
-            variants.append(code.lower())
-        if code.upper() != code:
-            variants.append(code.upper())
+
+        # голосование: самый частый ответ первым, затем остальные без повторов
+        from collections import Counter  # noqa: PLC0415
+
+        ordered: list[str] = []
+        counts = Counter(readings)
+        consensus = _vote_codes(readings)
+        if consensus:
+            ordered.append(consensus)
+        for code, _n in counts.most_common():
+            if code not in ordered:
+                ordered.append(code)
+        if len(counts) > 1:
+            log.info("Vision-модель: разные прочтения %s → голосование «%s»", readings, consensus)
+
+        # иногда регистр неоднозначен — пробуем вариант в нижнем/верхнем регистре
+        variants: list[str] = []
+        for code in ordered[:2]:
+            for cand in (code, code.lower(), code.upper()):
+                if cand not in variants:
+                    variants.append(cand)
         return variants
 
     async def _try_captcha_code(self, page, code: str, dump: bool) -> bool:
