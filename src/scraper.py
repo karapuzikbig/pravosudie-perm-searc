@@ -28,6 +28,7 @@ import logging
 import random
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -35,6 +36,17 @@ from .config import ScraperConfig, Settings
 from .parsers import Case, parse_case_html
 
 log = logging.getLogger(__name__)
+
+
+def _utf8_stream():
+    """Поток логов в UTF-8, чтобы кириллица не превращалась в кракозябры в Windows."""
+    import sys  # noqa: PLC0415
+
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+    return sys.stdout
 
 # Входная точка — главная портал ГАС «Правосудие».
 HOME_URL = "https://sudrf.ru/"
@@ -67,8 +79,15 @@ class CaptchaDetected(RuntimeError):
 
 
 def _clean_ocr_code(raw: str | None) -> str:
-    """Оставить в распознанном коде капчи только буквы и цифры."""
-    return "".join(ch for ch in (raw or "") if ch.isalnum())
+    """Оставить в коде капчи только русские строчные буквы (без цифр).
+
+    Капча портала состоит только из строчных русских букв. ddddocr отвечает
+    латиницей (свой алфавит), поэтому латинские буквы-двойники переводим в
+    кириллицу, а цифры, знаки и прочее отбрасываем.
+    """
+    from .captcha_ai import _to_cyrillic_lower  # noqa: PLC0415
+
+    return _to_cyrillic_lower(raw or "")
 
 
 def _html_has_captcha(html: str | None) -> bool:
@@ -198,6 +217,42 @@ class Scraper:
             log.exception("Не удалось сохранить HTML")
         await self._screenshot(page, tag)
 
+    async def _dump_text(self, page, tag: str) -> None:
+        """Сохранить компактное текстовое содержимое формы дел.
+
+        Большой HTML форума неудобно пересылать; здесь — выжимка: заголовки,
+        строки таблиц и ссылки вкладки административных дел и #search_results,
+        чтобы можно было без скриншотов понять структуру результатов.
+        """
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self.logs_dir / f"{tag}_{ts}.txt"
+        try:
+            lines = await page.evaluate(
+                """() => {
+                    const out = [];
+                    const root = document.querySelector('#bookmark_type_2')
+                        || document.querySelector('#search_results')
+                        || document.body;
+                    if (!root) return out;
+                    root.querySelectorAll('h1,h2,h3,h4,th,td,a,tr').forEach((el) => {
+                        const t = (el.innerText || el.textContent || '').trim()
+                            .replace(/\\s+/g, ' ');
+                        if (!t) return;
+                        if (el.tagName === 'A') {
+                            out.push('A[' + (el.getAttribute('href') || '') + '] ' + t);
+                        } else {
+                            out.push(el.tagName + ': ' + t);
+                        }
+                    });
+                    return out;
+                }"""
+            )
+            text = "\n".join(lines) if lines else "(пусто)"
+            path.write_text(text, encoding="utf-8")
+            log.info("Текст результатов сохранён: %s (%d строк)", path, len(lines))
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось сохранить текст результатов")
+
     def _date_window(self) -> str:
         today = datetime.now()
         date_from = today - timedelta(days=self.settings.lookback_days)
@@ -249,8 +304,22 @@ class Scraper:
                         ok = await self._open_case_search_on_site(page, site_url, dump)
                     except CaptchaDetected:
                         raise
-                    except Exception:  # noqa: BLE001
-                        log.warning("Пропускаю участок %s (не открылся)", site_url)
+                    except Exception as exc:  # noqa: BLE001
+                        # при --dump сохраняем саму страницу: так видно, на чём
+                        # именно упал участок (обычно — таймаут ожидания формы
+                        # после капчи при очень медленной отрисовке).
+                        # Полный traceback нужен, чтобы видеть исходную строку
+                        # вроде «await» с None (object NoneType ... in 'await').
+                        log.warning(
+                            "Пропускаю участок %s (не открылся: %s)", site_url, exc
+                        )
+                        log.warning(
+                            "Traceback падения участка %s:\n%s",
+                            site_url,
+                            traceback.format_exc(),
+                        )
+                        if dump:
+                            await self._dump(page, f"open_failed_{idx:02d}")
                         continue
                     if not ok:
                         if await self._is_blocked(page):
@@ -262,7 +331,7 @@ class Scraper:
                     # капча могла появиться/не пройти на шаге открытия сайта
                     if await self._has_captcha(page):
                         await self._pass_captcha(page, dump)
-                    if await self._has_captcha(page):
+                    if await self._captcha_field_present(page):
                         log.warning("Капча на %s не пройдена, пропускаю участок", site_url)
                         if dump:
                             await self._dump(page, f"captcha_skip_{idx:02d}")
@@ -276,7 +345,7 @@ class Scraper:
                         continue
                     if await self._has_captcha(page):
                         await self._pass_captcha(page, dump)
-                        if await self._has_captcha(page):
+                        if await self._captcha_field_present(page):
                             log.warning("Капча на %s не пройдена, пропускаю участок", site_url)
                             continue
                     try:
@@ -286,6 +355,7 @@ class Scraper:
                         continue
                     if dump:
                         await self._dump(page, f"after_submit_{idx:02d}")
+                        await self._dump_text(page, f"after_submit_{idx:02d}")
                     for _ in range(self.cfg.max_pages):
                         if await self._has_captcha(page):
                             await self._pass_captcha(page, dump)
@@ -427,29 +497,69 @@ class Scraper:
             return False
         # настоящий адрес модуля дел: /modules.php?name=sud_delo&op=hl
         delo_url = site_url.rstrip("/") + "/modules.php?name=sud_delo&op=hl"
-        try:
-            await page.goto(delo_url, wait_until="domcontentloaded")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не открылся модуль дел на %s: %s", site_url, exc)
+        opened = False
+        for attempt in range(2):
+            try:
+                await page.goto(
+                    delo_url,
+                    wait_until="domcontentloaded",
+                    timeout=max(self.cfg.timeout_ms, 60000),
+                )
+                opened = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Не открылся модуль дел на %s (попытка %d/2): %s",
+                    site_url,
+                    attempt + 1,
+                    exc,
+                )
+                self._pause()
+        if not opened:
             return False
         if await self._is_blocked(page):
             log.warning("403 на модуле дел %s", site_url)
             return False
         # модуль может сразу выдать капчу («дополнительную проверку»)
+        captcha_passed = False
         if await self._has_captcha(page):
             await self._pass_captcha(page, dump)
-        if await self._page_has_form(page):
-            return True
-        await self._pause()
-        if await self._click_link_texts(
-            page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
-        ):
-            if await self._has_captcha(page):
-                await self._pass_captcha(page, dump)
-            return await self._page_has_form(page)
-        if dump:
-            await self._dump(page, "site_no_form")
-        return False
+            captcha_passed = True
+        if not await self._page_has_form(page):
+            # сразу после принятой капчи страница часто ещё пустой JS-скелет:
+            # формы нет, но её дорисует скрипт. Ждать отрисовку будет
+            # вызывающий код (_wait_for_case_form), поэтому здесь даём шанс.
+            if captcha_passed:
+                return True
+            self._pause()
+            if await self._click_link_texts(
+                page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
+            ):
+                if await self._has_captcha(page):
+                    await self._pass_captcha(page, dump)
+                return await self._page_has_form(page)
+            if dump:
+                await self._dump(page, "site_no_form")
+            return False
+        # страница с формой на месте. Если это пустой JS-скелет после капчи,
+        # сама форма отрисуется позже — этим занимается вызывающий код
+        # (_wait_for_case_form), поэтому здесь возвращаем успех, чтобы участок
+        # не помечался «не открылся» сразу после принятой капчи.
+        return True
+
+    async def _captcha_field_present(self, page) -> bool:
+        """Стоит ли сейчас на странице поле ввода капчи (надёжнее, чем форма)."""
+        try:
+            if await page.locator('input[name="captcha-response"]').count() > 0:
+                return True
+            if await page.locator("#kcaptchaForm").count() > 0:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return _html_has_captcha(await page.content())
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _has_captcha(self, page) -> bool:
         """Капча определяется только по реальным элементам формы ввода.
@@ -486,38 +596,55 @@ class Scraper:
         """Пройти капчу: авто (ddddocr) с ретраями либо ручной ввод."""
         await self._screenshot(page, "captcha")
         if self.cfg.captcha_mode == "auto":
-            try:
-                if await self._auto_solve_captcha(page, dump):
+            # даём авто-решателю до двух полных заходов: поле капчи может
+            # «проскочить» на мгновение при перерисовке, а затем вернуться
+            for attempt in range(2):
+                try:
+                    solved = await self._auto_solve_captcha(page, dump)
+                except CaptchaDetected:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "Авто-решение капчи не удалось (%s), переходим к ручному вводу", exc
+                    )
+                    break
+                if solved and not await self._captcha_field_present(page):
                     log.info("Капча решена автоматически")
                     return
-            except CaptchaDetected:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Авто-решение капчи не удалось (%s), переходим к ручному вводу", exc)
+                if not solved and not await self._captcha_field_present(page):
+                    log.info("Капча исчезла после попыток — считаем пройденной")
+                    return
+                log.info("Поле капчи всё ещё на странице — повторяю авто-решение")
         await self._manual_captcha(page, dump)
 
     async def _auto_solve_captcha(self, page, dump: bool) -> bool:
-        """Распознать KCAPTCHA: сначала локально (ddddocr), затем vision-модель.
+        """Распознать KCAPTCHA: сначала vision-модель (кириллица), затем ddddocr.
 
-        Локальный OCR бесплатный и быстрый, поэтому пробуем его первым. Если
-        он недоступен, несколько раз подряд не дал уверенного кода или сервер
-        отверг распознанное — подключаем vision-модель (если задан ключ).
+        Vision-модель единственная реально читает русские буквы; ddddocr видит
+        их как латиницу и годится лишь как запасной приблизительный код. Для
+        каждой картинки перебираем кандидатов по одному; после отправки кода
+        картинка устаревает (сервер рисует новую), поэтому следующий кандидат
+        проверяем уже на новой картинке.
         """
+        # ddddocr как запасной кандидат: на кириллической капче он читает
+        # латиницей, и его приблизительные коды только засоряют перебор.
+        # По умолчанию не используем (ленивая инициализация — долгая).
         ocr = None
-        try:
-            import ddddocr  # noqa: PLC0415
+        if getattr(self.cfg, "captcha_use_ddddocr", False):
+            try:
+                import ddddocr  # noqa: PLC0415
+                from ddddocr import charsets  # noqa: PLC0415
 
-            ocr = ddddocr.DdddOcr(show_ad=False)
-        except Exception:  # noqa: BLE001
-            log.info("ddddocr недоступен — полагаемся на vision-модель")
+                ocr = ddddocr.DdddOcr(show_ad=False)
+                latin = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                if all(ch in charsets.CHARSET_OLD for ch in latin):
+                    ocr.ocr_engine.set_charset_range(latin)
+            except Exception:  # noqa: BLE001
+                log.info("ddddocr недоступен — полагаемся на vision-модель")
         if not await self._has_captcha(page):
             return True
 
-        vision_key = getattr(self.settings, "vision_api_key", "")
-        vision_allowed = self.cfg.captcha_vision_enabled and bool(vision_key)
-
         attempts = max(1, self.cfg.captcha_max_attempts)
-        local_failures = 0
         for attempt in range(1, attempts + 1):
             img_loc = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
             if await img_loc.count() == 0:
@@ -530,30 +657,20 @@ class Scraper:
             except Exception:  # noqa: BLE001
                 return False
 
-            code = ""
-            source = "ocr"
-            if ocr is not None and local_failures < 2:
-                code = self._local_ocr(ocr, img_bytes, attempt, attempts)
-            if not code and vision_allowed:
-                source = "vision"
-                for cand in self._vision_ocr(img_bytes):
-                    if await self._try_captcha_code(page, cand, dump):
-                        return True
-                # vision не помог — одна неудачная попытка, идём дальше
-                local_failures += 1
+            cands = self._captcha_candidates(ocr, img_bytes, attempt, attempts)
+            if not cands:
+                # ничего не распознали — перерисовать капчу и пробовать снова
+                await self._reload_captcha(page)
                 self._pause()
                 continue
-            if not code:
-                # локальный OCR пуст и vision недоступен — перерисовать капчу
-                if ocr is not None:
-                    local_failures += 1
-                await self._reload_captcha(page)
-                continue
 
-            if await self._try_captcha_code(page, code, dump):
+            code = cands[0]
+            accepted = await self._try_captcha_code(page, code, dump)
+            if accepted:
                 return True
-            log.info("Капча не принята (код «%s», %s), пробуем снова", code, source)
-            local_failures += 1
+            if len(cands) > 1:
+                # сервер уже показал новую капчу — остальные коды к ней не подходят
+                log.info("Капча не принята (код «%s»); остальные варианты устарели", code)
             self._pause()
         return False
 
@@ -596,27 +713,64 @@ class Scraper:
         )
         if not code:
             return []
-        # иногда модели возвращают и заглавные, и в нижнем регистре — пробуем оба
-        variants = [code]
-        if code.lower() != code:
-            variants.append(code.lower())
-        if code.upper() != code:
-            variants.append(code.upper())
-        return variants
+        # solve_captcha_vision уже отдаёт строку только из русских строчных
+        # букв (цифры и латиница преобразованы/убраны) — вариант один.
+        return [code]
+
+    def _captcha_candidates(self, ocr, img_bytes: bytes, attempt: int, attempts: int) -> list[str]:
+        """Кандидаты в коды для ОДНОЙ картинки в порядке приоритета.
+
+        Сначала отвечает vision-модель (она единственная реально читает
+        кириллицу). ddddocr видит капчу как латиницу и даёт лишь грубое
+        приближение, поэтому его код идёт последним и только как запасной.
+        Числа (длину) разных кандидатов не фильтруем — пусть сервер решает.
+        """
+        vision_key = getattr(self.settings, "vision_api_key", "")
+        vision_allowed = self.cfg.captcha_vision_enabled and bool(vision_key)
+        cands: list[str] = []
+        if vision_allowed:
+            for cand in self._vision_ocr(img_bytes):
+                if cand and cand not in cands:
+                    cands.append(cand)
+        if ocr is not None:
+            ocr_code = self._local_ocr(ocr, img_bytes, attempt, attempts)
+            if ocr_code and ocr_code not in cands:
+                cands.append(ocr_code)
+        return cands
 
     async def _try_captcha_code(self, page, code: str, dump: bool) -> bool:
-        """Ввести код капчи, отправить и проверить, принят ли."""
+        """Ввести код капчи, отправить и проверить, принят ли.
+
+        Успех — это когда пропало ПОЛЕ капчи (или появилась форма дел), а не
+        когда «форма исчезла»: при oшибочном коде kcaptcha не убирает форму,
+        а перерисовывает её с новой картинкой и сообщением об ошибке. Старая
+        проверка «форма исчезла» не отличала перерисовку от успеха.
+        """
         if not code:
             return False
         inp = page.locator('input[name="captcha-response"]').first
         if await inp.count() == 0:
             return False
         try:
-            await inp.fill(code)
+            # некоторые реализации проверяют код по мере ввода (oninput/onkeyup):
+            # вводим посимвольно, а не одним fill(), чтобы сработали обработчики
+            await inp.click()
+            await inp.fill("")
+            await inp.type(code, delay=80)
         except Exception:  # noqa: BLE001
-            return False
+            try:
+                await inp.fill(code)
+            except Exception:  # noqa: BLE001
+                return False
+        # запомним текущую картинку, чтобы отличить «перерисовали с новой»
+        # от «ещё ничего не произошло» при неверном коде
+        before = await self._captcha_img_src(page)
+        await asyncio.sleep(0.3)
+        log.info("Пробую код капчи «%s»", code)
         await self._submit_captcha(page)
-        ok = await self._wait_captcha_gone(page, timeout_ms=8000)
+        # на неверный код сервер перерисовывает капчу почти сразу — короткого
+        # ожидания достаточно; долгий поллинг только замедляет перебор
+        ok = await self._poll_until(page, lambda: self._captcha_solved(page), timeout_ms=4000)
         if ok:
             # форма дел дорисовывается JS уже после капчи — дождёмся её,
             # иначе сразу после «после капчи» страница ещё пустой скелет
@@ -624,45 +778,72 @@ class Scraper:
             if dump:
                 await self._dump(page, "after_captcha")
             return True
+        after = await self._captcha_img_src(page)
+        if dump:
+            await self._dump(page, "captcha_rejected")
+        if before and after and before == after:
+            log.info("Код капчи «%s» не принят (картинка не обновилась)", code)
+        else:
+            log.info("Код капчи «%s» не принят (капча перерисована)", code)
         return False
 
-    async def _fetch_captcha_image(self, page, img_loc) -> bytes:
-        """Получить PNG/JPEG байты картинки капчи.
-
-        Предпочтительно скачать по src через контекст запросов браузера —
-        так не теряется резкость из-за масштабирования элемента. Если не
-        удалось — снимаем скриншот самого элемента.
-        """
-        src = None
+    async def _captcha_img_src(self, page) -> str:
+        """Текущий src картинки капчи (пустая строка, если картинки нет)."""
         try:
-            src = await img_loc.get_attribute("src")
+            img = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
+            if await img.count() > 0:
+                return await img.get_attribute("src") or ""
         except Exception:  # noqa: BLE001
-            src = None
-        if src:
-            try:
-                from urllib.parse import urljoin  # noqa: PLC0415
+            pass
+        return ""
 
-                url = urljoin(page.url, src)
-                resp = await page.context.request.get(url)
-                if resp.ok:
-                    data = await resp.body()
-                    if data:
-                        return data
-            except Exception:  # noqa: BLE001
-                pass
+    async def _captcha_solved(self, page) -> bool:
+        """Капча принята: пропало поле ввода или появилась форма дел."""
+        try:
+            if await page.locator('input[name="captcha-response"]').count() == 0:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return await self._case_form_ready(page)
+
+    async def _fetch_captcha_image(self, page, img_loc) -> bytes:
+        """Получить байты именно той картинки капчи, что показана в форме.
+
+        Нельзя скачивать ``/captcha.php`` отдельным запросом: для kcaptcha
+        сервер держит картинку в сессии и на новый запрос может отдать
+        ДРУГУЮ капчу, не совпадающую с той, что в ``<img>`` на странице.
+        Тогда распознанный код относится не к той картинке, которую проверят,
+        и верный ответ всё равно отвергается. Поэтому снимаем скриншот самого
+        элемента — это гарантированно то, что видит пользователь.
+        """
         return await img_loc.screenshot()
 
     async def _submit_captcha(self, page) -> None:
+        """Отправить введённый код кнопкой «Продолжить» внутри формы капчи.
+
+        Нельзя кликать «первую попавшуюся кнопку»: в форме/рядом может быть
+        кнопка обновления капчи — клик по ней лишь меняет картинку и не
+        отправляет код.
+        """
         form = page.locator("#kcaptchaForm").first
         if await form.count() > 0:
-            for sel in ('input[type="submit"]', 'button[type="submit"]', "button"):
-                btn = form.locator(sel).first
-                try:
-                    if await btn.count() > 0:
-                        await btn.click()
-                        return
-                except Exception:  # noqa: BLE001
-                    continue
+            # сначала — кнопка с текстом «Продолжить» именно внутри формы
+            try:
+                btn = form.get_by_role("button", name="Продолжить").first
+                if await btn.count() > 0:
+                    await btn.click()
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                btn = form.get_by_role("button", name="Продолжить").first
+                if await btn.count() == 0:
+                    btn = form.locator('input[type="submit"]').first
+                if await btn.count() > 0:
+                    await btn.click()
+                    return
+            except Exception:  # noqa: BLE001
+                pass
         # запасной путь: Enter в поле
         inp = page.locator('input[name="captcha-response"]').first
         try:
@@ -671,7 +852,7 @@ class Scraper:
                 return
         except Exception:  # noqa: BLE001
             pass
-        # последняя надежда — любая кнопка «Продолжить»
+        # последняя надежда — кнопка «Продолжить» на странице
         try:
             await page.get_by_role("button", name="Продолжить").first.click()
         except Exception:  # noqa: BLE001
@@ -859,7 +1040,9 @@ class Scraper:
 
     async def _open_admin_tab(self, page) -> None:
         """Переключиться на вкладку «Дела об административных правонарушениях»."""
-        tab = page.locator("#bookmark_type_2, li#type_2").first
+        tab = page.locator("li#type_2").first
+        if await tab.count() == 0:
+            tab = page.locator("#bookmark_type_2").first
         try:
             if await tab.count() > 0:
                 self._pause()
@@ -879,16 +1062,44 @@ class Scraper:
             if await inp.count() == 0:
                 return False
         try:
+            await inp.scroll_into_view_if_needed()
             await inp.click()
             await inp.fill("")
             await inp.type(article, delay=50)
             await asyncio.sleep(0.5)
-            # autocomplete: подтверждаем первое совпадение, если есть список
+            # autocomplete: подтверждаем первый пункт из выпадающего списка.
+            # ArrowDown+Enter работает только когда список реально открыт;
+            # если его нет, эти клавиши могут отправить форму раньше времени.
+            picked = False
+            for sel in (
+                ".ui-autocomplete .ui-menu-item",
+                "ul.ui-autocomplete li",
+                ".ui-menu-item",
+            ):
+                item = page.locator(sel).first
+                try:
+                    if await item.count() > 0 and await item.is_visible():
+                        await item.click()
+                        picked = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not picked:
+                try:
+                    await inp.press("ArrowDown")
+                    await inp.press("Enter")
+                except Exception:  # noqa: BLE001
+                    pass
             try:
-                await inp.press("ArrowDown")
-                await inp.press("Enter")
+                value = await inp.input_value()
             except Exception:  # noqa: BLE001
-                pass
+                value = "?"
+            if not value:
+                log.warning(
+                    "Статья КоАП «%s» введена, но поле осталось пустым "
+                    "(autocomplete не выбрал значение)",
+                    article,
+                )
             return True
         except Exception:  # noqa: BLE001
             return False
@@ -1047,6 +1258,7 @@ def main() -> int:
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=_utf8_stream(),
     )
     from .config import parse_articles
 

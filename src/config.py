@@ -26,6 +26,7 @@ class ScraperConfig:
     captcha_wait_seconds: int = 120
     captcha_mode: str = "auto"  # auto | manual
     captcha_max_attempts: int = 8
+    captcha_use_ddddocr: bool = False
     screenshot_on_error: bool = True
     # vision-модель как «тяжёлая артиллерия», если локальный OCR не справляется
     captcha_vision_enabled: bool = True
@@ -84,7 +85,17 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
     raw: dict[str, Any] = {}
     if path.exists():
         with open(path, encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+            try:
+                raw = yaml.safe_load(fh) or {}
+            except yaml.YAMLError as exc:
+                where = ""
+                mark = getattr(exc, "problem_mark", None)
+                if mark is not None:
+                    where = f" (строка {mark.line + 1}, колонка {mark.column + 1})"
+                raise ValueError(
+                    f"Ошибка в {path}{where}: проверьте кавычки и отступы YAML. "
+                    f"Подробности: {exc}"
+                ) from exc
 
     scraper_raw = raw.get("scraper") or {}
     scraper = ScraperConfig(
@@ -96,6 +107,7 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         captcha_wait_seconds=int(scraper_raw.get("captcha_wait_seconds", 120)),
         captcha_mode=str(scraper_raw.get("captcha_mode", "auto")).lower(),
         captcha_max_attempts=int(scraper_raw.get("captcha_max_attempts", 8)),
+        captcha_use_ddddocr=bool(scraper_raw.get("captcha_use_ddddocr", False)),
         screenshot_on_error=bool(scraper_raw.get("screenshot_on_error", True)),
         captcha_vision_enabled=bool(scraper_raw.get("captcha_vision_enabled", True)),
         captcha_vision_model=str(scraper_raw.get("captcha_vision_model", "gpt-4o-mini")),

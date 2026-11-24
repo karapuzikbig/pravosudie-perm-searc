@@ -149,10 +149,13 @@ def test_collect_precinct_urls_drops_portal_and_bare_msudrf():
     assert urls == ["http://5.perm.msudrf.ru/modules.php?name=sud_delo"]
 
 
-def test_clean_ocr_code_keeps_alnum():
+def test_clean_ocr_code_keeps_only_cyrillic_lower():
     from src.scraper import _clean_ocr_code
 
-    assert _clean_ocr_code(" aB-c1 2! ") == "aBc12"
+    # латиница-двойники → кириллица, цифры и знаки выкидываем
+    assert _clean_ocr_code(" aB-c1 2! ") == "авс"
+    assert _clean_ocr_code("mowwaup") == "мошшаир"
+    assert _clean_ocr_code("Кот12") == "кот"
     assert _clean_ocr_code(None) == ""
     assert _clean_ocr_code("") == ""
 
@@ -172,9 +175,9 @@ def test_html_has_captcha_by_structure():
 def test_vote_codes_picks_most_frequent_then_longest():
     from src.scraper import _vote_codes
 
-    assert _vote_codes(["abcd", "abcf", "abcd"]) == "abcd"
-    assert _vote_codes(["abc", "ab", "abc"]) == "abc"
-    assert _vote_codes(["", None, "xy"]) == "xy"
+    assert _vote_codes(["котш", "котп", "котш"]) == "котш"
+    assert _vote_codes(["кот", "ко", "кот"]) == "кот"
+    assert _vote_codes(["", None, "ха"]) == "ха"
     assert _vote_codes([]) == ""
 
 
@@ -256,4 +259,180 @@ def test_wait_for_case_form_returns_false_on_empty_skeleton():
     assert ok is False
 
 
+def test_captcha_solved_true_when_input_gone():
+    s = _scraper()
 
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(0 if sel == 'input[name="captcha-response"]' else 0)
+
+    assert asyncio.run(s._captcha_solved(_Page())) is True
+
+
+def test_captcha_solved_true_when_case_form_present():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            if sel == 'input[name="captcha-response"]':
+                return _Loc(1)
+            return _Loc(1 if sel in ("#bookmark_type_2", "li#type_2") else 0)
+
+    assert asyncio.run(s._captcha_solved(_Page())) is True
+
+
+def test_captcha_solved_false_when_input_still_there_and_no_form():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(1 if sel == 'input[name="captcha-response"]' else 0)
+
+    assert asyncio.run(s._captcha_solved(_Page())) is False
+
+
+
+def test_captcha_field_present_true_when_input_there():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(1 if sel == 'input[name="captcha-response"]' else 0)
+
+        async def content(self):
+            return '<input name="captcha-response">'
+
+    assert asyncio.run(s._captcha_field_present(_Page())) is True
+
+
+def test_captcha_field_present_false_when_skeleton_without_captcha():
+    s = _scraper()
+
+    class _Loc:
+        async def count(self):
+            return 0
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc()
+
+        async def content(self):
+            return "<html><body><div id='app'></div></body></html>"
+
+    assert asyncio.run(s._captcha_field_present(_Page())) is False
+
+
+def test_ddddocr_disabled_by_default():
+    from src.config import ScraperConfig
+
+    assert ScraperConfig().captcha_use_ddddocr is False
+
+
+def test_open_case_search_no_form_branch_does_not_await_sync_pause(monkeypatch):
+    # регрессия: _pause синхронная, после капчи без формы её звали через await,
+    # из-за чего участок падал с "object NoneType can't be used in 'await' expression"
+    s = _scraper()
+    monkeypatch.setattr(s, "cfg", type(s.cfg)(delay_min_between_requests=0, delay_max_between_requests=0))
+
+    async def _not_blocked(_page):
+        return False
+
+    async def _no_captcha(_page):
+        return False
+
+    async def _no_form(_page):
+        return False
+
+    async def _no_links(_page, _texts):
+        return False
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(s, "_is_blocked", _not_blocked)
+    monkeypatch.setattr(s, "_has_captcha", _no_captcha)
+    monkeypatch.setattr(s, "_page_has_form", _no_form)
+    monkeypatch.setattr(s, "_click_link_texts", _no_links)
+    monkeypatch.setattr(s, "_dump", _noop)
+    monkeypatch.setattr(s, "_open_site_with_retry", lambda *_a, **_k: _true())
+
+    class _Page:
+        async def goto(self, *_a, **_k):
+            return None
+
+        async def content(self):
+            return "<html></html>"
+
+    result = asyncio.run(s._open_case_search_on_site(_Page(), "http://1.perm.msudrf.ru", False))
+    assert result is False
+
+
+async def _true():
+    return True
+
+
+def test_open_case_search_returns_true_after_captcha_without_form(monkeypatch):
+    # после принятой капчи страница — JS-скелет без <form>; участок нельзя
+    # сразу помечать «не открылся», отрисовку ждёт _wait_for_case_form
+    s = _scraper()
+    monkeypatch.setattr(s, "cfg", type(s.cfg)(delay_min_between_requests=0, delay_max_between_requests=0))
+
+    async def _not_blocked(_page):
+        return False
+
+    async def _captcha(_page):
+        return True
+
+    async def _pass(_page, _dump):
+        return None
+
+    async def _no_form(_page):
+        return False
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(s, "_is_blocked", _not_blocked)
+    monkeypatch.setattr(s, "_has_captcha", _captcha)
+    monkeypatch.setattr(s, "_pass_captcha", _pass)
+    monkeypatch.setattr(s, "_page_has_form", _no_form)
+    monkeypatch.setattr(s, "_dump", _noop)
+    monkeypatch.setattr(s, "_open_site_with_retry", lambda *_a, **_k: _true())
+
+    class _Page:
+        async def goto(self, *_a, **_k):
+            return None
+
+        async def content(self):
+            return "<html></html>"
+
+    result = asyncio.run(s._open_case_search_on_site(_Page(), "http://1.perm.msudrf.ru", False))
+    assert result is True

@@ -14,7 +14,7 @@
 Для Yandex IAM-токен живёт ~12 часов, поэтому его удобно брать из
 переменной окружения / файла, который периодически обновляют
 (``yc iam create-token``). Идентификатор каталога задаётся либо прямо в
-имени модели (``gpt://<folder_id>/qwen2.5-vl-32b-instruct/latest``), либо
+имени модели (``gpt://<folder_id>/<vision-модель>/latest``), либо
 заголовком ``x-folder-id`` (``folder_id``).
 
 Ключ берётся из переменной окружения VISION_API_KEY (или OPENAI_API_KEY).
@@ -25,16 +25,121 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import urllib.error
 import urllib.request
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
 _PROMPT = (
-    "На картинке капча (KCAPTCHA): латинские буквы и цифры, искажённые волнами "
-    "и шумом. Верни ТОЛЬКО символы капчи без пробелов, знаков препинания и "
-    "пояснений. Если не уверен — верни наиболее вероятный вариант."
+    "Распознай текст на капче. Отвечай ОДНИМ словом — только символами капчи, "
+    "без рассуждений, пробелов и пояснений. Капча состоит ТОЛЬКО из русских "
+    "строчных букв (кириллица), без цифр и без латинских букв; буквы искажены "
+    "волнами и шумом. Например: «ажур». Не заменяй русские буквы латинскими "
+    "и не добавляй цифры. Не пиши ничего, кроме ответа."
 )
+
+
+def _build_payload(prompt: str, img_bytes: bytes, model: str) -> dict:
+    """Собрать тело запроса к OpenAI-совместимому vision-API.
+
+    Для reasoning-моделей (Qwen3 и т.п.) отключаем «размышления» и даём
+    запас токенов, иначе ответ обрезается (finish_reason=length, content=null).
+    """
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    return {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 1000,
+        "reasoning_effort": "none",
+        "thinking": {"type": "disabled"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+    }
+
+# Код капчи портала — слово ТОЛЬКО из русских строчных букв (кириллица), без
+# цифр. Модель иногда отвечает латиницей вместо похожих русских букв, поэтому
+# латинские символы переводим в кириллицу по визуальному сходству, а всё прочее
+# (цифры, знаки) отбрасываем.
+CYRILLIC_LOWER = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+
+# Латиница → кириллица по визуальному сходству заглавных и строчных букв,
+# как их пишут на капче (ddddocr отвечает латиницей).
+_LATIN_TO_CYRILLIC = {
+    "a": "а", "b": "ь", "c": "с", "d": "д", "e": "е", "f": "ф", "g": "д",
+    "h": "н", "i": "и", "j": "й", "k": "к", "l": "л", "m": "м", "n": "п",
+    "o": "о", "p": "р", "q": "я", "r": "г", "s": "с", "t": "т", "u": "и",
+    "v": "в", "w": "ш", "x": "х", "y": "у", "z": "з",
+    "A": "а", "B": "в", "C": "с", "D": "д", "E": "е", "F": "ф", "G": "д",
+    "H": "н", "I": "и", "J": "й", "K": "к", "L": "л", "M": "м", "N": "п",
+    "O": "о", "P": "р", "Q": "я", "R": "г", "S": "с", "T": "т", "U": "и",
+    "V": "в", "W": "ш", "X": "х", "Y": "у", "Z": "з",
+}
+_LATIN_TO_CYRILLIC["j"] = "й"
+
+_NOISE_WORDS = {
+    "капча", "картинке", "картинка", "код", "буквы", "буква", "символы", "символ",
+    "русские", "кириллица", "текст", "ответ", "изображение", "изображении",
+}
+
+
+def _to_cyrillic_lower(text: str) -> str:
+    """Привести к строке из русских строчных букв.
+
+    Латинские буквы по визуальному сходству переводятся в кириллицу; цифры и
+    прочие символы убираются; всё остальное (включая «ё») — в нижний регистр.
+    """
+    out: list[str] = []
+    for ch in text:
+        if ch in _LATIN_TO_CYRILLIC:
+            out.append(_LATIN_TO_CYRILLIC[ch])
+        else:
+            low = ch.lower()
+            if low in CYRILLIC_LOWER:
+                out.append(low)
+    return "".join(out)
+
+
+def extract_code(text: str | None) -> str:
+    """Извлечь код капчи из ответа модели (только русские строчные буквы).
+
+    Сначала отбрасываем служебные слова («капча», «код», «буквы»…), которые
+    модель может дописать, потом переводим латинские буквы-двойники в
+    кириллицу, убираем цифры и знаки и берём самое длинное короткое «слово».
+    """
+    import re  # noqa: PLC0415
+
+    if not text:
+        return ""
+    tokens = re.findall(r"[^\s,.;:!?«»\"'“”()]+", text)
+    kept = [
+        t for t in tokens
+        if _to_cyrillic_lower(t) and _to_cyrillic_lower(t) not in _NOISE_WORDS
+    ]
+    if not kept:
+        kept = tokens
+    # «слово» капчи — самый длинный токен из 2–8 русских букв
+    best = ""
+    for tok in kept:
+        cand = _to_cyrillic_lower(tok)
+        if 2 <= len(cand) <= 8 and len(cand) > len(best):
+            best = cand
+    return best or _to_cyrillic_lower(text)
+
+
+def _sanitize_key(api_key: str) -> str:
+    """Убрать пробелы/переводы строк из ключа — HTTP-заголовки идут в latin-1."""
+    return (api_key or "").strip()
 
 
 def solve_captcha_vision(
@@ -52,30 +157,19 @@ def solve_captcha_vision(
     Возвращает строку только из букв/цифр либо None при ошибке/без ключа.
     ``auth_scheme``: "bearer" (по умолчанию) или "api-key" (Yandex API-ключ).
     """
+    api_key = _sanitize_key(api_key)
     if not api_key:
         log.info("Ключ vision-модели не задан (VISION_API_KEY) — пропускаю")
         return None
+    if not api_key.isascii():
+        log.warning(
+            "В ключе vision-модели есть не-ASCII символы (похоже, вставлен "
+            "плейсхолдер вроде '<ключ>') — проверьте VISION_API_KEY"
+        )
+        return None
     if not img_bytes:
         return None
-
-    b64 = base64.b64encode(img_bytes).decode("ascii")
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "max_tokens": 20,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}"},
-                    },
-                ],
-            }
-        ],
-    }
+    payload = _build_payload(_PROMPT, img_bytes, model)
     url = base_url.rstrip("/") + "/chat/completions"
     data = json.dumps(payload).encode("utf-8")
 
@@ -94,20 +188,102 @@ def solve_captcha_vision(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # тело ответа обычно содержит причину (особенно у Yandex Cloud)
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            detail = ""
+        log.warning(
+            "Vision-запрос к капче не удался: HTTP %s %s. auth_scheme=%s, "
+            "модель=%s. Ответ: %s",
+            exc.code,
+            exc.reason,
+            auth_scheme,
+            model,
+            detail[:500] or "(пусто)",
+        )
+        return None
     except Exception as exc:  # noqa: BLE001
         log.warning("Vision-запрос к капче не удался: %s", exc)
         return None
 
     try:
-        text = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0]
+        msg = choice["message"]
     except (KeyError, IndexError, TypeError):
-        log.warning("Неожиданный ответ vision-модели: %s", str(body)[:200])
+        log.warning("Неожиданный ответ vision-модели: %s", str(body)[:300])
         return None
+    text = msg.get("content")
     if isinstance(text, list):
         text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-    code = "".join(ch for ch in (text or "") if ch.isalnum())
+    log.info(
+        "Vision-модель ответила: %r (finish=%s, usage=%s)",
+        (text or "")[:200],
+        choice.get("finish_reason"),
+        body.get("usage"),
+    )
+    code = extract_code(text)
     if not code:
         log.info("Vision-модель не вернула читаемых символов")
         return None
     log.info("Vision-модель распознала капчу: «%s»", code)
     return code
+
+
+def probe_vision(
+    img_bytes: bytes,
+    *,
+    api_key: str,
+    model: str,
+    base_url: str = "https://llm.api.cloud.yandex.net/v1",
+    auth_scheme: str = "api-key",
+    folder_id: str = "",
+    timeout: float = 30.0,
+) -> None:
+    """Отправить капчу в модель и напечатать СЫРОЙ ответ/ошибку (для отладки)."""
+    payload = _build_payload(_PROMPT, img_bytes, model)
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": (
+            f"Api-Key {api_key}" if auth_scheme == "api-key" else f"Bearer {api_key}"
+        ),
+    }
+    if folder_id:
+        headers["x-folder-id"] = folder_id
+    data = json.dumps(payload).encode("utf-8")
+    print("URL:", url)
+    print("model:", model, "| auth:", auth_scheme, "| folder:", folder_id or "-")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            print("HTTP", resp.status)
+            print(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        print("HTTP ERROR", exc.code, exc.reason)
+        try:
+            print(exc.read().decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as exc:  # noqa: BLE001
+        print("ERROR:", exc)
+
+
+if __name__ == "__main__":
+    import sys  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    if len(sys.argv) < 2:
+        print("usage: python -m src.captcha_ai <captcha.png>")
+        raise SystemExit(2)
+    import os  # noqa: PLC0415
+
+    probe_vision(
+        Path(sys.argv[1]).read_bytes(),
+        api_key=os.getenv("VISION_API_KEY", "") or os.getenv("OPENAI_API_KEY", ""),
+        model=os.getenv("VISION_MODEL", ""),
+        base_url=os.getenv("VISION_BASE_URL", "https://llm.api.cloud.yandex.net/v1"),
+        auth_scheme=os.getenv("VISION_AUTH_SCHEME", "api-key"),
+        folder_id=os.getenv("YANDEX_FOLDER_ID", ""),
+    )

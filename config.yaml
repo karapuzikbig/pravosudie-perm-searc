@@ -34,22 +34,24 @@ scraper:
   max_pages: 20             # предохранитель от зацикливания пагинации
   captcha_mode: "auto"      # auto — распознавать капчу (ddddocr) с ретраями; manual — вводить вручную
   captcha_max_attempts: 8   # сколько раз пробовать распознать капчу за один заход
+  captcha_use_ddddocr: false # ddddocr как запасной кандидат (на кириллице почти бесполезен)
   captcha_wait_seconds: 120 # сколько ждать ручного ввода капчи (режим manual / запасной)
   # Vision-модель — «тяжёлая артиллерия», если локальный OCR (ddddocr) не справляется.
   # Нужен ключ в .env: VISION_API_KEY (или OPENAI_API_KEY). Работает по OpenAI-
   # совместимому API, поэтому можно указать другой base_url и модель.
   #
-  # ── Yandex Cloud Foundation Models (работает из РФ, IAM-токен) ──
-  #   1) получите IAM-токен:  yc iam create-token   (живёт ~12 часов)
-  #   2) в .env:   VISION_API_KEY=<IAM-токен>   YANDEX_FOLDER_ID=<id каталога>
-  #   3) включите блок ниже (раскомментируйте):
-  # captcha_vision_model: "gpt://<folder_id>/qwen2.5-vl-32b-instruct/latest"
+  # ── Yandex Cloud Foundation Models (работает из РФ, API-ключ сервисного аккаунта) ──
+  #   1) создайте сервисный аккаунт с ролью ai.languageModels.user;
+  #   2) создайте ему API-ключ со scope yc.ai.languageModels.execute;
+  #   3) в .env:   VISION_API_KEY=<API-ключ>   YANDEX_FOLDER_ID=<id каталога>
+  #   4) включите блок ниже (раскомментируйте и подставьте id каталога):
+  # captcha_vision_model: "gpt://<folder_id>/<vision-модель>/latest"
   # captcha_vision_base_url: "https://llm.api.cloud.yandex.net/v1"
-  # captcha_vision_auth_scheme: "bearer"   # для IAM-токена; "api-key" — для API-ключа
+  # captcha_vision_auth_scheme: "api-key"    # для API-ключа; "bearer" — для IAM-токена (~12 ч)
   # captcha_vision_folder_id: "<folder_id>"  # можно не дублировать, если задан YANDEX_FOLDER_ID
   captcha_vision_enabled: true
-  captcha_vision_model: "gpt-4o-mini"
-  captcha_vision_base_url: "https://api.openai.com/v1"
-  captcha_vision_auth_scheme: "bearer"   # bearer — OpenAI/OpenRouter/Yandex IAM; api-key — Yandex API-ключ
-  captcha_vision_folder_id: ""           # Yandex Cloud: id каталога (или YANDEX_FOLDER_ID в .env)
+  captcha_vision_model: "gpt://b1g77j5jn2mrpm2b94i7/qwen3.6-35b-a3b/latest"
+  captcha_vision_base_url: "https://llm.api.cloud.yandex.net/v1"
+  captcha_vision_auth_scheme: "api-key"
+  captcha_vision_folder_id: "b1g77j5jn2mrpm2b94i7"
   screenshot_on_error: true # сохранять скриншот в logs/ при сбое парсинга
