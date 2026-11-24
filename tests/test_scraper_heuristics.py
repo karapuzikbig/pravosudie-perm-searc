@@ -397,3 +397,42 @@ def test_open_case_search_no_form_branch_does_not_await_sync_pause(monkeypatch):
 
 async def _true():
     return True
+
+
+def test_open_case_search_returns_true_after_captcha_without_form(monkeypatch):
+    # после принятой капчи страница — JS-скелет без <form>; участок нельзя
+    # сразу помечать «не открылся», отрисовку ждёт _wait_for_case_form
+    s = _scraper()
+    monkeypatch.setattr(s, "cfg", type(s.cfg)(delay_min_between_requests=0, delay_max_between_requests=0))
+
+    async def _not_blocked(_page):
+        return False
+
+    async def _captcha(_page):
+        return True
+
+    async def _pass(_page, _dump):
+        return None
+
+    async def _no_form(_page):
+        return False
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(s, "_is_blocked", _not_blocked)
+    monkeypatch.setattr(s, "_has_captcha", _captcha)
+    monkeypatch.setattr(s, "_pass_captcha", _pass)
+    monkeypatch.setattr(s, "_page_has_form", _no_form)
+    monkeypatch.setattr(s, "_dump", _noop)
+    monkeypatch.setattr(s, "_open_site_with_retry", lambda *_a, **_k: _true())
+
+    class _Page:
+        async def goto(self, *_a, **_k):
+            return None
+
+        async def content(self):
+            return "<html></html>"
+
+    result = asyncio.run(s._open_case_search_on_site(_Page(), "http://1.perm.msudrf.ru", False))
+    assert result is True

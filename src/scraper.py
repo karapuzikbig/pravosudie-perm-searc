@@ -521,9 +521,16 @@ class Scraper:
             log.warning("403 на модуле дел %s", site_url)
             return False
         # модуль может сразу выдать капчу («дополнительную проверку»)
+        captcha_passed = False
         if await self._has_captcha(page):
             await self._pass_captcha(page, dump)
+            captcha_passed = True
         if not await self._page_has_form(page):
+            # сразу после принятой капчи страница часто ещё пустой JS-скелет:
+            # формы нет, но её дорисует скрипт. Ждать отрисовку будет
+            # вызывающий код (_wait_for_case_form), поэтому здесь даём шанс.
+            if captcha_passed:
+                return True
             self._pause()
             if await self._click_link_texts(
                 page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
