@@ -657,12 +657,11 @@ class Scraper:
         )
         if not code:
             return []
-        # иногда модели возвращают и заглавные, и в нижнем регистре — пробуем оба
+        # Капча — строчные русские буквы. Пробуем код как есть и в нижнем
+        # регистре (на случай заглавных от модели); верхний регистр не нужен.
         variants = [code]
         if code.lower() != code:
             variants.append(code.lower())
-        if code.upper() != code:
-            variants.append(code.upper())
         return variants
 
     async def _try_captcha_code(self, page, code: str, dump: bool) -> bool:
