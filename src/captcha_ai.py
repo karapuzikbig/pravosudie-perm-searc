@@ -3,7 +3,19 @@
 Используется, когда локальный OCR (ddddocr) не даёт уверенного результата.
 Работает по OpenAI-совместимому Chat Completions API (image_url в base64),
 поэтому подходит и для OpenAI, и для любых совместимых шлюзов (в т.ч.
-локальных), если указать базовый URL и модель в config.yaml.
+локальных), а также для Yandex Cloud Foundation Models.
+
+Авторизация настраивается через ``auth_scheme``:
+  * "bearer"  — ``Authorization: Bearer <ключ>`` (OpenAI, OpenRouter,
+    и Yandex Cloud при IAM-токене);
+  * "api-key" — ``Authorization: Api-Key <ключ>`` (Yandex API-ключ
+    сервисного аккаунта).
+
+Для Yandex IAM-токен живёт ~12 часов, поэтому его удобно брать из
+переменной окружения / файла, который периодически обновляют
+(``yc iam create-token``). Идентификатор каталога задаётся либо прямо в
+имени модели (``gpt://<folder_id>/qwen2.5-vl-32b-instruct/latest``), либо
+заголовком ``x-folder-id`` (``folder_id``).
 
 Ключ берётся из переменной окружения VISION_API_KEY (или OPENAI_API_KEY).
 Если ключа нет — модуль просто не срабатывает, и остаётся локальный OCR.
@@ -31,11 +43,14 @@ def solve_captcha_vision(
     api_key: str,
     model: str = "gpt-4o-mini",
     base_url: str = "https://api.openai.com/v1",
+    auth_scheme: str = "bearer",
+    folder_id: str = "",
     timeout: float = 30.0,
 ) -> Optional[str]:
     """Отправить картинку капчи в vision-модель, вернуть распознанный код.
 
     Возвращает строку только из букв/цифр либо None при ошибке/без ключа.
+    ``auth_scheme``: "bearer" (по умолчанию) или "api-key" (Yandex API-ключ).
     """
     if not api_key:
         log.info("Ключ vision-модели не задан (VISION_API_KEY) — пропускаю")
@@ -63,15 +78,19 @@ def solve_captcha_vision(
     }
     url = base_url.rstrip("/") + "/chat/completions"
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
+
+    if auth_scheme == "api-key":
+        auth_header = f"Api-Key {api_key}"
+    else:
+        auth_header = f"Bearer {api_key}"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": auth_header,
+    }
+    if folder_id:
+        headers["x-folder-id"] = folder_id
+
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             body = json.loads(resp.read().decode("utf-8"))

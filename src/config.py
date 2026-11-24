@@ -31,6 +31,8 @@ class ScraperConfig:
     captcha_vision_enabled: bool = True
     captcha_vision_model: str = "gpt-4o-mini"
     captcha_vision_base_url: str = "https://api.openai.com/v1"
+    captcha_vision_auth_scheme: str = "bearer"  # bearer | api-key (Yandex API-ключ)
+    captcha_vision_folder_id: str = ""  # Yandex Cloud: id каталога (x-folder-id)
 
 
 @dataclass
@@ -99,6 +101,13 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         captcha_vision_model=str(scraper_raw.get("captcha_vision_model", "gpt-4o-mini")),
         captcha_vision_base_url=str(
             scraper_raw.get("captcha_vision_base_url", "https://api.openai.com/v1")
+        ),
+        captcha_vision_auth_scheme=str(
+            scraper_raw.get("captcha_vision_auth_scheme", "bearer")
+        ).lower(),
+        captcha_vision_folder_id=str(
+            scraper_raw.get("captcha_vision_folder_id", "")
+            or os.getenv("YANDEX_FOLDER_ID", "")
         ),
     )
 

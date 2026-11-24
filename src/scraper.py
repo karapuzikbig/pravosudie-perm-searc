@@ -579,6 +579,8 @@ class Scraper:
             api_key=getattr(self.settings, "vision_api_key", ""),
             model=self.cfg.captcha_vision_model,
             base_url=self.cfg.captcha_vision_base_url,
+            auth_scheme=self.cfg.captcha_vision_auth_scheme,
+            folder_id=self.cfg.captcha_vision_folder_id,
         )
         if not code:
             return []
