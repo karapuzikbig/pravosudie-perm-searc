@@ -303,8 +303,13 @@ class Scraper:
                         ok = await self._open_case_search_on_site(page, site_url, dump)
                     except CaptchaDetected:
                         raise
-                    except Exception:  # noqa: BLE001
-                        log.warning("Пропускаю участок %s (не открылся)", site_url)
+                    except Exception as exc:  # noqa: BLE001
+                        # при --dump сохраняем саму страницу: так видно, на чём
+                        # именно упал участок (обычно — таймаут ожидания формы
+                        # после капчи при очень медленной отрисовке)
+                        log.warning("Пропускаю участок %s (не открылся: %s)", site_url, exc)
+                        if dump:
+                            await self._dump(page, f"open_failed_{idx:02d}")
                         continue
                     if not ok:
                         if await self._is_blocked(page):
@@ -1018,7 +1023,9 @@ class Scraper:
 
     async def _open_admin_tab(self, page) -> None:
         """Переключиться на вкладку «Дела об административных правонарушениях»."""
-        tab = page.locator("#bookmark_type_2, li#type_2").first
+        tab = page.locator("li#type_2").first
+        if await tab.count() == 0:
+            tab = page.locator("#bookmark_type_2").first
         try:
             if await tab.count() > 0:
                 self._pause()
@@ -1038,16 +1045,34 @@ class Scraper:
             if await inp.count() == 0:
                 return False
         try:
+            await inp.scroll_into_view_if_needed()
             await inp.click()
             await inp.fill("")
             await inp.type(article, delay=50)
             await asyncio.sleep(0.5)
-            # autocomplete: подтверждаем первое совпадение, если есть список
-            try:
-                await inp.press("ArrowDown")
-                await inp.press("Enter")
-            except Exception:  # noqa: BLE001
-                pass
+            # autocomplete: подтверждаем первый пункт из выпадающего списка.
+            # ArrowDown+Enter работает только когда список реально открыт;
+            # если его нет, эти клавиши могут отправить форму раньше времени.
+            picked = False
+            for sel in (
+                ".ui-autocomplete .ui-menu-item",
+                "ul.ui-autocomplete li",
+                ".ui-menu-item",
+            ):
+                item = page.locator(sel).first
+                try:
+                    if await item.count() > 0 and await item.is_visible():
+                        await item.click()
+                        picked = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not picked:
+                try:
+                    await inp.press("ArrowDown")
+                    await inp.press("Enter")
+                except Exception:  # noqa: BLE001
+                    pass
             return True
         except Exception:  # noqa: BLE001
             return False
