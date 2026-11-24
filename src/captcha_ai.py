@@ -99,7 +99,7 @@ def solve_captcha_vision(
     payload = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 20,
+        "max_tokens": 300,
         "messages": [
             {
                 "role": "user",
@@ -152,13 +152,24 @@ def solve_captcha_vision(
         return None
 
     try:
-        text = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0]
+        msg = choice["message"]
     except (KeyError, IndexError, TypeError):
-        log.warning("Неожиданный ответ vision-модели: %s", str(body)[:200])
+        log.warning("Неожиданный ответ vision-модели: %s", str(body)[:300])
         return None
+    text = msg.get("content")
     if isinstance(text, list):
         text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-    log.info("Vision-модель ответила: %r", (text or "")[:200])
+    # reasoning-модели (Qwen3 и др.) могут вернуть пустой content, а ответ —
+    # в reasoning_content; берём его как запасной вариант.
+    if not text:
+        text = msg.get("reasoning_content") or ""
+    log.info(
+        "Vision-модель ответила: %r (finish=%s, usage=%s)",
+        (text or "")[:200],
+        choice.get("finish_reason"),
+        body.get("usage"),
+    )
     code = extract_code(text)
     if not code:
         log.info("Vision-модель не вернула читаемых символов")
@@ -182,7 +193,7 @@ def probe_vision(
     payload = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 20,
+        "max_tokens": 300,
         "messages": [
             {
                 "role": "user",
