@@ -28,6 +28,7 @@ import logging
 import random
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -306,8 +307,17 @@ class Scraper:
                     except Exception as exc:  # noqa: BLE001
                         # при --dump сохраняем саму страницу: так видно, на чём
                         # именно упал участок (обычно — таймаут ожидания формы
-                        # после капчи при очень медленной отрисовке)
-                        log.warning("Пропускаю участок %s (не открылся: %s)", site_url, exc)
+                        # после капчи при очень медленной отрисовке).
+                        # Полный traceback нужен, чтобы видеть исходную строку
+                        # вроде «await» с None (object NoneType ... in 'await').
+                        log.warning(
+                            "Пропускаю участок %s (не открылся: %s)", site_url, exc
+                        )
+                        log.warning(
+                            "Traceback падения участка %s:\n%s",
+                            site_url,
+                            traceback.format_exc(),
+                        )
                         if dump:
                             await self._dump(page, f"open_failed_{idx:02d}")
                         continue
