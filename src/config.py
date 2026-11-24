@@ -26,6 +26,7 @@ class ScraperConfig:
     captcha_wait_seconds: int = 120
     captcha_mode: str = "auto"  # auto | manual
     captcha_max_attempts: int = 30
+    captcha_input_case: str = "lower"  # lower | upper | asis — регистр ввода кода капчи
     screenshot_on_error: bool = True
     # vision-модель как «тяжёлая артиллерия», если локальный OCR не справляется
     captcha_vision_enabled: bool = True
@@ -102,6 +103,7 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         captcha_wait_seconds=int(scraper_raw.get("captcha_wait_seconds", 120)),
         captcha_mode=str(scraper_raw.get("captcha_mode", "auto")).lower(),
         captcha_max_attempts=int(scraper_raw.get("captcha_max_attempts", 30)),
+        captcha_input_case=str(scraper_raw.get("captcha_input_case", "lower")).lower(),
         screenshot_on_error=bool(scraper_raw.get("screenshot_on_error", True)),
         captcha_vision_enabled=bool(scraper_raw.get("captcha_vision_enabled", True)),
         captcha_vision_model=str(scraper_raw.get("captcha_vision_model", "gpt-4o-mini")),        captcha_vision_base_url=str(

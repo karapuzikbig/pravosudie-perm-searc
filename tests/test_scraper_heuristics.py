@@ -159,6 +159,16 @@ def test_clean_ocr_code_keeps_cyrillic_only():
     assert _clean_ocr_code("") == ""
 
 
+def test_apply_input_case_defaults_to_lower():
+    s = _scraper()
+    assert s.cfg.captcha_input_case == "lower"
+    assert s._apply_input_case("АБВГД") == "абвгд"
+    s.cfg.captcha_input_case = "upper"
+    assert s._apply_input_case("абвгд") == "АБВГД"
+    s.cfg.captcha_input_case = "asis"
+    assert s._apply_input_case("АбВгД") == "АбВгД"
+
+
 def test_html_has_captcha_by_structure():
     from src.scraper import _html_has_captcha
 

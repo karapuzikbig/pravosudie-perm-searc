@@ -808,16 +808,33 @@ class Scraper:
         if len(counts) > 1:
             log.info("Vision-модель: разные прочтения %s → голосование «%s»", readings, consensus)
 
-        # иногда регистр неоднозначен — пробуем вариант в нижнем/верхнем регистре
+        # Регистр на вводе применяется отдельно (_apply_input_case), поэтому
+        # здесь возвращаем только разные прочтения, без вариантов lower/upper.
         variants: list[str] = []
         for code in ordered[:2]:
-            for cand in (code, code.lower(), code.upper()):
-                if cand not in variants:
-                    variants.append(cand)
+            if code not in variants:
+                variants.append(code)
         return variants
+
+    def _apply_input_case(self, code: str) -> str:
+        """Привести распознанный код к регистру, который принимает поле.
+
+        KCAPTCHA рисует буквы заглавными, но сайт участка сверяет код в
+        нижнем регистре — поэтому ввод по умолчанию приводим к ``lower``
+        (настраивается ``captcha_input_case``: lower | upper | asis).
+        """
+        mode = (self.cfg.captcha_input_case or "lower").lower()
+        if mode == "lower":
+            return code.lower()
+        if mode == "upper":
+            return code.upper()
+        return code
 
     async def _try_captcha_code(self, page, code: str, dump: bool) -> bool:
         """Ввести код капчи, отправить и проверить, принят ли."""
+        if not code:
+            return False
+        code = self._apply_input_case(code)
         if not code:
             return False
         inp = page.locator('input[name="captcha-response"]').first
