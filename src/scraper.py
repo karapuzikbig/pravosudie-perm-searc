@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import logging
 import random
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -33,7 +34,7 @@ from pathlib import Path
 
 from .config import BASE_DIR, ScraperConfig, Settings
 from .excel_export import append_cases
-from .parsers import Case, has_cases_table, parse_case_html
+from .parsers import Case, has_cases_table, parse_case_html, parse_date
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +113,22 @@ ERROR_500_MARKERS = (
     "500 ошибка",
     "произошла ошибка",
 )
+
+
+def _extract_schedule_date(html: str | None) -> datetime | None:
+    """Дата выбранного дня в «Списке дел на день» (поле name="H_date").
+
+    В таблице расписания даты нет — она в поле выбранного дня, напр.
+    ``<input name="H_date" value="24.11.2026">``. Возвращаем дату или None.
+    """
+    if not html:
+        return None
+    m = re.search(r'name="H_date"[^>]*value="([^"]+)"', html, re.IGNORECASE)
+    if not m:
+        m = re.search(r'value="([^"]+)"[^>]*name="H_date"', html, re.IGNORECASE)
+    if not m:
+        return None
+    return parse_date(m.group(1))
 
 
 def _html_is_500(html: str | None) -> bool:
@@ -390,7 +407,15 @@ class Scraper:
                             log.warning("Капча на %s не пройдена, пропускаю участок", site_url)
                             continue
                     try:
-                        await self._fill_and_submit(page, wanted, dump)
+                        if await self._page_has_form(page):
+                            await self._fill_and_submit(page, wanted, dump)
+                        else:
+                            # готовый список дел без формы — искать нечего,
+                            # сразу читаем то, что отрисовано
+                            log.info(
+                                "На %s нет формы поиска — разбираю готовый список дел",
+                                site_url,
+                            )
                     except Exception:  # noqa: BLE001
                         log.warning("Не удалось отправить форму на %s", site_url)
                         continue
@@ -409,6 +434,14 @@ class Scraper:
                             )
                             break
                         cases = parse_case_html(html, url=page.url)
+                        # В «Списке дел на день» дата заседания — не в строке,
+                        # а в поле выбранного дня (name="H_date"). Подставляем её
+                        # делам без даты, иначе теряется день и ломается дедуп.
+                        day = _extract_schedule_date(html)
+                        if day:
+                            for case in cases:
+                                if case.hearing and case.hearing.date is None:
+                                    case.hearing.date = day
                         matching = [
                             c for c in cases if not c.article or c.matches_articles(wanted)
                         ]
@@ -634,13 +667,28 @@ class Scraper:
             await self._pass_captcha(page, dump)
         if await self._page_has_form(page):
             return True
+        # Некоторые участки отдают сразу готовый «Список дел, назначенных к
+        # рассмотрению» — без формы поиска. Если на странице уже есть таблица
+        # дел, принимаем её как источник и разбираем напрямую.
+        try:
+            if has_cases_table(await page.content()):
+                log.info("Формы нет, но найден готовый список дел на %s", site_url)
+                return True
+        except Exception:  # noqa: BLE001
+            pass
         await self._pause()
         if await self._click_link_texts(
             page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
         ):
             if await self._has_captcha(page):
                 await self._pass_captcha(page, dump)
-            return await self._page_has_form(page)
+            if await self._page_has_form(page):
+                return True
+            try:
+                if has_cases_table(await page.content()):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
         if dump:
             await self._dump(page, "site_no_form")
         return False
@@ -1404,10 +1452,19 @@ def main() -> int:
     parser.add_argument("--dump", action="store_true", help="сохранять HTML и скриншоты шагов в logs/")
     parser.add_argument("--articles", help="статьи через запятую, напр. '12.8,20.20'")
     args = parser.parse_args()
+    from .config import BASE_DIR
+
+    log_dir = BASE_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_dir / "scraper.log", encoding="utf-8"),
+        ],
     )
+    logging.getLogger(__name__).info("Лог пишется в %s", log_dir / "scraper.log")
     from .config import parse_articles
 
     articles = parse_articles(args.articles) if args.articles else None

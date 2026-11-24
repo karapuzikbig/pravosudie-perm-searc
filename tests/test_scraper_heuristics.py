@@ -425,3 +425,13 @@ def test_auto_solve_empty_code_reloads_without_input():
     assert ok is False
     assert calls["fill"] == 0
     assert calls["reload"] >= 1
+
+
+def test_extract_schedule_date_from_h_date():
+    from src.scraper import _extract_schedule_date
+
+    html = '<input type="text" class="date-picker" name="H_date" value="24.11.2026" id="dp1">'
+    d = _extract_schedule_date(html)
+    assert d is not None and d.day == 24 and d.month == 11 and d.year == 2026
+    assert _extract_schedule_date("<html>без даты</html>") is None
+    assert _extract_schedule_date("") is None
