@@ -30,6 +30,7 @@ class ScraperConfig:
     screenshot_on_error: bool = True
     # vision-модель как «тяжёлая артиллерия», если локальный OCR не справляется
     captcha_vision_enabled: bool = True
+    captcha_use_local_ocr: bool = False  # ddddocr бесполезен для кириллицы
     captcha_vision_model: str = "gpt://<folder_id>/qwen2.5-vl-32b-instruct/latest"
     captcha_vision_base_url: str = "https://api.openai.com/v1"
     captcha_vision_auth_scheme: str = "bearer"  # bearer | api-key (Yandex API-ключ)
@@ -106,6 +107,7 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         captcha_input_case=str(scraper_raw.get("captcha_input_case", "lower")).lower(),
         screenshot_on_error=bool(scraper_raw.get("screenshot_on_error", True)),
         captcha_vision_enabled=bool(scraper_raw.get("captcha_vision_enabled", True)),
+        captcha_use_local_ocr=bool(scraper_raw.get("captcha_use_local_ocr", False)),
         captcha_vision_model=str(scraper_raw.get("captcha_vision_model", "gpt-4o-mini")),        captcha_vision_base_url=str(
             scraper_raw.get("captcha_vision_base_url", "https://api.openai.com/v1")
         ),

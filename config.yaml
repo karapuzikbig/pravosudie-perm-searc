@@ -50,6 +50,7 @@ scraper:
   # captcha_vision_auth_scheme: "api-key"    # для API-ключа; "bearer" — для IAM-токена (~12 ч)
   # captcha_vision_folder_id: "<folder_id>"  # можно не дублировать, если задан YANDEX_FOLDER_ID
   captcha_vision_enabled: true
+  captcha_use_local_ocr: false  # ddddocr не читает кириллицу — выключаем
   captcha_vision_model: "gpt://b1g77j5jn2mrpm2b94i7/qwen3.6-35b-a3b/latest"
   captcha_vision_base_url: "https://llm.api.cloud.yandex.net/v1"
   captcha_vision_auth_scheme: "api-key"

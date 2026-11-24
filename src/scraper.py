@@ -234,11 +234,13 @@ def _clean_captcha_for_vision(img_bytes: bytes) -> bytes:
 
 
 def _vote_codes(codes: list[str]) -> str:
-    """Выбрать самый частый код среди прочтений (по среднему при равенстве).
+    """Выбрать самый частый код среди прочтений (регистронезависимо).
 
-    Несколько предобработанных вариантов и повторные прогоны дают набор
-    гипотез. Берём самый частый; при равенстве — самый длинный (KCAPTCHA
-    обычно 5–6 символов, обрезанное чтение короче).
+    Модель часто читает один и тот же код в разном регистре («ФЯФСДТС» и
+    «фяфсдтс») — это голос за один код, а не два разных. Поэтому голосуем
+    по коду в нижнем регистре, а возвращаем его же (ввод всё равно
+    приводится к нужному регистру отдельно). При равенстве — самый длинный
+    (KCAPTCHA обычно 5–6 символов, обрезанное чтение короче).
     """
     from collections import Counter  # noqa: PLC0415
 
@@ -246,7 +248,8 @@ def _vote_codes(codes: list[str]) -> str:
     cleaned = [c for c in cleaned if c]
     if not cleaned:
         return ""
-    counts = Counter(cleaned)
+    lowered = [c.lower() for c in cleaned]
+    counts = Counter(lowered)
     best_count = max(counts.values())
     candidates = [c for c, n in counts.items() if n == best_count]
     candidates.sort(key=len, reverse=True)
@@ -377,7 +380,9 @@ class Scraper:
                     except CaptchaDetected:
                         raise
                     except Exception:  # noqa: BLE001
-                        log.warning("Пропускаю участок %s (не открылся)", site_url)
+                        log.warning("Пропускаю участок %s (не открылся)", site_url, exc_info=True)
+                        if dump:
+                            await self._dump(page, f"site_error_{idx:02d}")
                         continue
                     if not ok:
                         if await self._is_blocked(page):
@@ -651,11 +656,33 @@ class Scraper:
             return False
         # настоящий адрес модуля дел: /modules.php?name=sud_delo&op=hl
         delo_url = site_url.rstrip("/") + "/modules.php?name=sud_delo&op=hl"
-        try:
-            await page.goto(delo_url, wait_until="domcontentloaded")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не открылся модуль дел на %s: %s", site_url, exc)
-            return False
+        goto_ok = False
+        last_exc = None
+        for gtry in (1, 2):
+            try:
+                await page.goto(delo_url, wait_until="domcontentloaded")
+                goto_ok = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                msg = str(exc)
+                # Навигация могла прерваться из-за параллельного редиректа
+                # (капча/антибот) — это не повод бросать участок: проверяем,
+                # что реально на странице ниже.
+                if "ERR_ABORTED" in msg or "Navigation" in msg or "interrupted" in msg.lower():
+                    log.info("Навигация к модулю дел %s прервана (%s), разбираю текущую страницу", site_url, msg)
+                    break
+                log.warning("Не открылся модуль дел на %s (попытка %d): %s", site_url, gtry, exc)
+                self._pause()
+        if not goto_ok and last_exc is not None and "delo_url" not in page.url:
+            # если не удалось и на странице нет капчи/результатов — сдаёмся
+            if not await self._has_captcha(page):
+                try:
+                    if not has_cases_table(await page.content()):
+                        log.warning("Не открылся модуль дел на %s: %s", site_url, last_exc)
+                        return False
+                except Exception:  # noqa: BLE001
+                    return False
         if await self._is_blocked(page):
             log.warning("403 на модуле дел %s", site_url)
             return False
@@ -747,12 +774,15 @@ class Scraper:
         (если задан ключ). Локальный OCR оставляем как дешёвую первую попытку.
         """
         ocr = None
-        try:
-            import ddddocr  # noqa: PLC0415
+        # ddddocr обучен на латинице и для кириллической KCAPTCHA всегда даёт
+        # пусто — не тратим на него время, если нет явного разрешения.
+        if getattr(self.cfg, "captcha_use_local_ocr", False):
+            try:
+                import ddddocr  # noqa: PLC0415
 
-            ocr = ddddocr.DdddOcr(show_ad=False)
-        except Exception:  # noqa: BLE001
-            log.info("ddddocr недоступен — полагаемся на vision-модель")
+                ocr = ddddocr.DdddOcr(show_ad=False)
+            except Exception:  # noqa: BLE001
+                log.info("ddddocr недоступен — полагаемся на vision-модель")
         if not await self._has_captcha(page):
             return True
 
@@ -852,25 +882,19 @@ class Scraper:
     def _vision_ocr(self, img_bytes: bytes) -> str:
         """Спросить vision-модель; вернуть единственный лучший код (или "").
 
-        Модель ошибается на отдельных буквах, поэтому опрашиваем её на
-        нескольких вариантах картинки (оригинал + очищенная KCAPTCHA) и
-        берём согласованный ответ. Возвращаем ровно один код: на одну
-        картинку допустим только один ввод, иначе после неудачной отправки
-        (сервер уже сменил капчу) следующий кандидат уйдёт в НОВОЕ поле.
+        KCAPTCHA сильно искажена шумом/волнами, и «сырая» картинка часто
+        читается хуже очищенной. Поэтому сначала спрашиваем модель по
+        очищенному (крупному контрастному) варианту; оригинал — лишь
+        запасной путь, если очистка не удалась или не дала ответа. Возвращаем
+        ровно один код: на одну картинку допустим только один ввод.
         """
         try:
             from .captcha_ai import solve_captcha_vision  # noqa: PLC0415
         except Exception:  # noqa: BLE001
             return ""
 
-        imgs = [img_bytes]
-        cleaned = _clean_captcha_for_vision(img_bytes)
-        if cleaned and cleaned != img_bytes:
-            imgs.append(cleaned)
-
-        readings: list[str] = []
-        for data in imgs:
-            code = solve_captcha_vision(
+        def ask(data: bytes) -> str:
+            return solve_captcha_vision(
                 data,
                 api_key=getattr(self.settings, "vision_api_key", ""),
                 model=self.cfg.captcha_vision_model,
@@ -879,16 +903,17 @@ class Scraper:
                 folder_id=self.cfg.captcha_vision_folder_id,
                 max_tokens=self.cfg.captcha_vision_max_tokens,
                 reasoning_effort=self.cfg.captcha_vision_reasoning_effort,
-            )
-            if code:
-                readings.append(code)
+            ) or ""
 
-        if not readings:
-            return ""
-        consensus = _vote_codes(readings)
-        if len(set(readings)) > 1:
-            log.info("Vision-модель: прочтения %s → выбрано «%s»", readings, consensus)
-        return consensus
+        cleaned = _clean_captcha_for_vision(img_bytes)
+        primary = cleaned if cleaned and cleaned != img_bytes else img_bytes
+        code = ask(primary)
+        if code:
+            return code
+        # очищенная не дала ответа — пробуем оригинал
+        if primary != img_bytes:
+            return ask(img_bytes)
+        return ""
 
     def _apply_input_case(self, code: str) -> str:
         """Привести распознанный код к регистру, который принимает поле.
