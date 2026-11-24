@@ -44,7 +44,7 @@ scraper:
   #   2) создайте ему API-ключ со scope yc.ai.languageModels.execute;
   #   3) в .env:   VISION_API_KEY=<API-ключ>   YANDEX_FOLDER_ID=<id каталога>
   #   4) включите блок ниже (раскомментируйте и подставьте id каталога):
-  # captcha_vision_model: "gpt://<folder_id>/qwen2.5-vl-32b-instruct/latest"
+  # captcha_vision_model: "gpt://<folder_id>/<vision-модель>/latest"
   # captcha_vision_base_url: "https://llm.api.cloud.yandex.net/v1"
   # captcha_vision_auth_scheme: "api-key"    # для API-ключа; "bearer" — для IAM-токена (~12 ч)
   # captcha_vision_folder_id: "<folder_id>"  # можно не дублировать, если задан YANDEX_FOLDER_ID
