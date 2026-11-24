@@ -14,7 +14,7 @@ import webbrowser
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-from .config import Settings, parse_articles
+from .config import BASE_DIR, Settings, parse_articles
 from .parsers import Case
 from .scraper import CaptchaDetected, Scraper
 
@@ -202,7 +202,10 @@ class App(tk.Tk):
         self.destroy()
 
     def _on_open_excel(self) -> None:
-        path = Path(self.settings.scraper.output_excel).resolve()
+        path = Path(self.settings.scraper.output_excel)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        path = path.resolve()
         if not path.exists():
             messagebox.showinfo(
                 "Excel пока нет",

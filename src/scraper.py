@@ -31,7 +31,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .config import ScraperConfig, Settings
+from .config import BASE_DIR, ScraperConfig, Settings
 from .excel_export import append_cases
 from .parsers import Case, has_cases_table, parse_case_html
 
@@ -412,6 +412,19 @@ class Scraper:
                         matching = [
                             c for c in cases if not c.article or c.matches_articles(wanted)
                         ]
+                        if not matching:
+                            # Таблица есть, но ни одного дела не извлекли/не
+                            # прошло по статьям — сохраняем HTML для разбора,
+                            # иначе файл Excel так и не создастся «молча».
+                            log.warning(
+                                "На %s (стр. %d): таблица найдена, но дел после "
+                                "разбора/фильтра по статьям нет (распознано=%d). "
+                                "HTML сохранён в logs.",
+                                site_url,
+                                page_no,
+                                len(cases),
+                            )
+                            await self._dump(page, f"nocases_{idx:02d}_p{page_no:02d}")
                         added = self._save_to_excel(matching)
                         for case in matching:
                             collected.setdefault(case.uid, case)
@@ -1307,14 +1320,26 @@ class Scraper:
                 continue
         return False
 
+    def _excel_path(self) -> Path:
+        """Путь к Excel-файлу с результатами (абсолютный, от корня проекта).
+
+        Относительный путь (``data/cases.xlsx``) резолвим от каталога проекта,
+        а не от текущей рабочей директории — иначе файл создавался в
+        неожиданном месте в зависимости от того, откуда запущена программа.
+        """
+        path = Path(self.cfg.output_excel)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        return path
+
     def _save_to_excel(self, cases: list[Case]) -> int:
         """Дописать пачку дел в общий Excel-файл (по одной строке на дело)."""
         if not cases:
             return 0
         try:
-            return append_cases(self.cfg.output_excel, cases)
+            return append_cases(self._excel_path(), cases)
         except Exception:  # noqa: BLE001
-            log.exception("Не удалось записать дела в Excel (%s)", self.cfg.output_excel)
+            log.exception("Не удалось записать дела в Excel (%s)", self._excel_path())
             return 0
 
     async def _read_results_html(
