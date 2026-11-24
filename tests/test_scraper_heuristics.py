@@ -373,3 +373,55 @@ def test_vision_empty_content_returns_none(monkeypatch):
     latin = {"choices": [{"message": {"content": "roZe"}, "finish_reason": "stop"}]}
     monkeypatch.setattr(captcha_ai.urllib.request, "urlopen", lambda *a, **k: _Resp(latin))
     assert captcha_ai.solve_captcha_vision(b"img", api_key="k") is None
+
+
+def test_auto_solve_empty_code_reloads_without_input():
+    s = _scraper()
+    s.cfg.captcha_max_attempts = 2
+    s.cfg.captcha_vision_enabled = False
+    s.settings.vision_api_key = ""
+    s._pause = lambda: None
+    s._save_captcha_image = lambda *a, **k: None
+
+    calls = {"reload": 0, "fill": 0}
+
+    class _ImgLoc:
+        async def count(self):
+            return 1
+
+    class _Loc:
+        def __init__(self, sel):
+            self.sel = sel
+
+        @property
+        def first(self):
+            return self
+
+        async def count(self):
+            return 1 if "img" in self.sel else 0
+
+        async def fill(self, _code):  # ввод кода — не должен вызываться
+            calls["fill"] += 1
+
+    async def _fake_fetch(self, page, loc):
+        return b"png-bytes"
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(sel)
+
+    async def _fake_reload(self, page):
+        calls["reload"] += 1
+
+    async def _fake_has(self, page):
+        return True
+
+    s._fetch_captcha_image = _fake_fetch.__get__(s)
+    s._reload_captcha = _fake_reload.__get__(s)
+    s._has_captcha = _fake_has.__get__(s)
+    s._local_ocr = lambda *a, **k: ""
+
+    ok = asyncio.run(s._auto_solve_captcha(_Page(), dump=False))
+    assert ok is False
+    assert calls["fill"] == 0
+    assert calls["reload"] >= 1

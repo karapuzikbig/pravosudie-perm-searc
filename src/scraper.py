@@ -703,8 +703,14 @@ class Scraper:
                 return False
             try:
                 img_bytes = await self._fetch_captcha_image(page, img_loc)
-            except Exception:  # noqa: BLE001
-                return False
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Не удалось получить картинку капчи: %s", exc)
+                await self._reload_captcha(page)
+                continue
+            if not img_bytes:
+                log.warning("Картинка капчи пустая (0 байт) — обновляю и повторяю")
+                await self._reload_captcha(page)
+                continue
 
             code = ""
             source = "ocr"
@@ -714,10 +720,21 @@ class Scraper:
                 source = "vision"
                 code = self._vision_ocr(img_bytes)
             if not code:
-                # локальный OCR пуст и vision недоступен — перерисовать капчу
+                # Распознавание не дало кода: без «тихого» обновления картинки
+                # сохраняем её в logs для разбора и логируем причину.
+                self._save_captcha_image(img_bytes, attempt)
+                log.info(
+                    "Капча, попытка %d/%d: код не распознан (ocr=%s, vision=%s) — "
+                    "картинка сохранена в logs, пробую ещё раз",
+                    attempt,
+                    attempts,
+                    "есть" if ocr is not None else "нет",
+                    "вкл" if vision_allowed else "выкл",
+                )
                 if ocr is not None:
                     local_failures += 1
                 await self._reload_captcha(page)
+                self._pause()
                 continue
 
             # ВАЖНО: на одну картинку — ровно один ввод. После неудачной
@@ -731,6 +748,16 @@ class Scraper:
             await self._reload_captcha(page)
             self._pause()
         return False
+
+    def _save_captcha_image(self, img_bytes: bytes, attempt: int) -> None:
+        """Сохранить картинку капчи в logs/ для разбора проблемных случаев."""
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = self.logs_dir / f"captcha_unread_{ts}_a{attempt}.png"
+            path.write_bytes(img_bytes)
+            log.info("Картинка нераспознанной капчи сохранена: %s", path)
+        except Exception:  # noqa: BLE001
+            log.debug("Не удалось сохранить картинку капчи", exc_info=True)
 
     def _local_ocr(self, ocr, img_bytes: bytes, attempt: int, attempts: int) -> str:
         """Локальное распознавание с предобработкой и голосованием вариантов."""
