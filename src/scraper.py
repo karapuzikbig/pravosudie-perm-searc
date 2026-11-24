@@ -676,6 +676,7 @@ class Scraper:
             await inp.fill(code)
         except Exception:  # noqa: BLE001
             return False
+        log.info("Пробую код капчи «%s»", code)
         await self._submit_captcha(page)
         ok = await self._wait_captcha_gone(page, timeout_ms=8000)
         if ok:
@@ -685,6 +686,7 @@ class Scraper:
             if dump:
                 await self._dump(page, "after_captcha")
             return True
+        log.info("Код капчи «%s» не принят", code)
         return False
 
     async def _fetch_captcha_image(self, page, img_loc) -> bytes:
