@@ -82,3 +82,178 @@ def test_select_option_by_text_exact():
     sel = FakeSelect("city", [("Пермь", "p"), ("Березники", "b")])
     assert asyncio.run(s._select_option_by_text(sel, "Пермь"))
     assert sel.selected == "Пермь"
+
+
+class FakeAnchor:
+    def __init__(self, href):
+        self._href = href
+
+    async def get_attribute(self, name):
+        return self._href if name == "href" else None
+
+
+class FakePage:
+    def __init__(self, url, hrefs):
+        self.url = url
+        self._hrefs = hrefs
+
+    def locator(self, _sel):
+        return FakeList([FakeAnchor(h) for h in self._hrefs])
+
+
+def test_collect_precinct_urls_filters_and_absolutizes():
+    s = _scraper()
+    page = FakePage(
+        "https://sudrf.ru/index.php?id=300&act=go_ms_search",
+        [
+            "http://59.perm.msudrf.ru/",
+            "/index.php?id=300&page=2",
+            "http://1.perm.msudrf.ru/",
+            "javascript:void(0)",
+            "#ms",
+            "http://59.perm.msudrf.ru/",
+            "http://counter.sudrf.ru/cnt.php",
+        ],
+    )
+    urls = asyncio.run(s._collect_precinct_urls(page))
+    assert urls == ["http://59.perm.msudrf.ru/", "http://1.perm.msudrf.ru/"]
+
+
+class FakeContentPage:
+    def __init__(self, html):
+        self._html = html
+
+    async def content(self):
+        return self._html
+
+
+def test_is_blocked_detects_403():
+    s = _scraper()
+    blocked = FakeContentPage("<html><body>403 Доступ запрещен</body></html>")
+    ok = FakeContentPage("<html><body>Список дел</body></html>")
+    assert asyncio.run(s._is_blocked(blocked)) is True
+    assert asyncio.run(s._is_blocked(ok)) is False
+
+
+def test_collect_precinct_urls_drops_portal_and_bare_msudrf():
+    s = _scraper()
+    page = FakePage(
+        "https://sudrf.ru/index.php?id=300&act=go_ms_search",
+        [
+            "https://sudrf.ru/",
+            "http://msudrf.ru/",
+            "http://5.perm.msudrf.ru/modules.php?name=sud_delo",
+        ],
+    )
+    urls = asyncio.run(s._collect_precinct_urls(page))
+    assert urls == ["http://5.perm.msudrf.ru/modules.php?name=sud_delo"]
+
+
+def test_clean_ocr_code_keeps_alnum():
+    from src.scraper import _clean_ocr_code
+
+    assert _clean_ocr_code(" aB-c1 2! ") == "aBc12"
+    assert _clean_ocr_code(None) == ""
+    assert _clean_ocr_code("") == ""
+
+
+def test_html_has_captcha_by_structure():
+    from src.scraper import _html_has_captcha
+
+    assert _html_has_captcha('<form id="kcaptchaForm">…</form>') is True
+    assert _html_has_captcha("<input name='captcha-response'>") is True
+    assert _html_has_captcha('<img src="/captcha.php?r=1">') is True
+    assert _html_has_captcha("<html><body>Список дел</body></html>") is False
+    assert _html_has_captcha("captcha.php") is False
+    assert _html_has_captcha(None) is False
+    assert _html_has_captcha("") is False
+
+
+def test_vote_codes_picks_most_frequent_then_longest():
+    from src.scraper import _vote_codes
+
+    assert _vote_codes(["abcd", "abcf", "abcd"]) == "abcd"
+    assert _vote_codes(["abc", "ab", "abc"]) == "abc"
+    assert _vote_codes(["", None, "xy"]) == "xy"
+    assert _vote_codes([]) == ""
+
+
+def test_prepare_captcha_variants_degrades_on_bad_bytes():
+    from src.scraper import _prepare_captcha_variants
+
+    variants = _prepare_captcha_variants(b"not-an-image")
+    assert variants == [b"not-an-image"]
+
+
+def test_vision_solver_no_key_returns_none():
+    from src.captcha_ai import solve_captcha_vision
+
+    assert solve_captcha_vision(b"img", api_key="") is None
+    assert solve_captcha_vision(b"", api_key="k") is None
+
+
+class _ScriptedPage:
+    """page-заглушка: каждая проверка возвращает очередное значение."""
+
+    def __init__(self, values):
+        self._values = list(values)
+        self.calls = 0
+
+    async def probe(self):
+        self.calls += 1
+        return self._values.pop(0) if self._values else self._values_last
+
+    _values_last = False
+
+
+def test_poll_until_requires_two_consecutive_hits():
+    s = _scraper()
+    # False, True, False, True, True → успех только на 5-й проверке
+    page = _ScriptedPage([False, True, False, True, True])
+    ok = asyncio.run(s._poll_until(page, page.probe, timeout_ms=10000))
+    assert ok is True
+    assert page.calls == 5
+
+
+def test_poll_until_times_out_when_never_stable():
+    s = _scraper()
+    # True чередуется с False — два подряд так и не набираются
+    page = _ScriptedPage([True, False] * 100)
+    ok = asyncio.run(s._poll_until(page, page.probe, timeout_ms=1500))
+    assert ok is False
+
+
+def test_wait_for_case_form_detects_admin_tab():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(1 if sel in ("#bookmark_type_2", "li#type_2") else 0)
+
+    ok = asyncio.run(s._wait_for_case_form(_Page(), timeout_ms=1000))
+    assert ok is True
+
+
+def test_wait_for_case_form_returns_false_on_empty_skeleton():
+    s = _scraper()
+
+    class _Loc:
+        async def count(self):
+            return 0
+
+    class _Page:
+        def locator(self, _sel):
+            return _Loc()
+
+    ok = asyncio.run(s._wait_for_case_form(_Page(), timeout_ms=700))
+    assert ok is False
+
+
+

@@ -23,7 +23,16 @@ class ScraperConfig:
     delay_min_between_requests: float = 1.5
     delay_max_between_requests: float = 3.5
     max_pages: int = 20
+    captcha_wait_seconds: int = 120
+    captcha_mode: str = "auto"  # auto | manual
+    captcha_max_attempts: int = 8
     screenshot_on_error: bool = True
+    # vision-модель как «тяжёлая артиллерия», если локальный OCR не справляется
+    captcha_vision_enabled: bool = True
+    captcha_vision_model: str = "gpt-4o-mini"
+    captcha_vision_base_url: str = "https://api.openai.com/v1"
+    captcha_vision_auth_scheme: str = "bearer"  # bearer | api-key (Yandex API-ключ)
+    captcha_vision_folder_id: str = ""  # Yandex Cloud: id каталога (x-folder-id)
 
 
 @dataclass
@@ -39,6 +48,7 @@ class Settings:
     # из .env / окружения
     db_path: str = "data/pravosudie.db"
     log_level: str = "INFO"
+    vision_api_key: str = ""
 
     def effective_articles(self, raw: str | None = None) -> list[str]:
         """Разобрать строку статей из поля ввода ('12.8, 20.20 6.9')."""
@@ -83,7 +93,22 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         delay_min_between_requests=float(scraper_raw.get("delay_min_between_requests", 1.5)),
         delay_max_between_requests=float(scraper_raw.get("delay_max_between_requests", 3.5)),
         max_pages=int(scraper_raw.get("max_pages", 20)),
+        captcha_wait_seconds=int(scraper_raw.get("captcha_wait_seconds", 120)),
+        captcha_mode=str(scraper_raw.get("captcha_mode", "auto")).lower(),
+        captcha_max_attempts=int(scraper_raw.get("captcha_max_attempts", 8)),
         screenshot_on_error=bool(scraper_raw.get("screenshot_on_error", True)),
+        captcha_vision_enabled=bool(scraper_raw.get("captcha_vision_enabled", True)),
+        captcha_vision_model=str(scraper_raw.get("captcha_vision_model", "gpt-4o-mini")),
+        captcha_vision_base_url=str(
+            scraper_raw.get("captcha_vision_base_url", "https://api.openai.com/v1")
+        ),
+        captcha_vision_auth_scheme=str(
+            scraper_raw.get("captcha_vision_auth_scheme", "bearer")
+        ).lower(),
+        captcha_vision_folder_id=str(
+            scraper_raw.get("captcha_vision_folder_id", "")
+            or os.getenv("YANDEX_FOLDER_ID", "")
+        ),
     )
 
     articles = [str(a).strip() for a in (raw.get("articles") or []) if str(a).strip()]
@@ -98,4 +123,5 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         scraper=scraper,
         db_path=os.getenv("DB_PATH", "data/pravosudie.db"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        vision_api_key=os.getenv("VISION_API_KEY", "") or os.getenv("OPENAI_API_KEY", ""),
     )
