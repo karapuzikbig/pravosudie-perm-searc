@@ -97,3 +97,46 @@ def test_uid_stable():
     a = Case(case_number="5-1/2025", article="12.8", hearing=Hearing(raw="12.03.2025"))
     b = Case(case_number="5-1/2025", article="12.8", hearing=Hearing(raw="12.03.2025"))
     assert a.uid == b.uid
+
+
+PARTICIPANTS_TABLE_HTML = """
+<html><body>
+<table>
+  <tr><th>Номер дела</th><th>Дата заседания</th><th>Время</th><th>Участники дела</th></tr>
+  <tr>
+    <td><a href="/modules.php?id=5-321/2025">5-321/2025</a></td>
+    <td>18.06.2025</td>
+    <td>10:15</td>
+    <td>Иванов И.И., Петров П.П.</td>
+  </tr>
+</table>
+</body></html>
+"""
+
+
+def test_parse_participants_and_separate_date_time():
+    cases = parse_case_html(PARTICIPANTS_TABLE_HTML, url="https://sudrf.ru/search")
+    assert len(cases) == 1
+    c = cases[0]
+    assert c.case_number == "5-321/2025"
+    assert c.hearing.date_str == "18.06.2025"
+    assert c.hearing.time_str == "10:15"
+    assert "Иванов И.И" in c.participants
+    assert "Петров П.П" in c.participants
+
+
+def test_has_cases_table():
+    from src.parsers import has_cases_table
+
+    assert has_cases_table(PARTICIPANTS_TABLE_HTML) is True
+    assert has_cases_table(TABLE_HTML) is True
+    assert has_cases_table("<html><body>Ничего не найдено</body></html>") is False
+    assert has_cases_table("") is False
+
+
+def test_dedup_key_distinguishes_hearings():
+    a = Case(case_number="5-1/2025", article="12.8", hearing=Hearing(raw="12.03.2025 14:30"))
+    b = Case(case_number="5-1/2025", article="12.8", hearing=Hearing(raw="20.03.2025 10:00"))
+    assert a.dedup_key != b.dedup_key
+    same = Case(case_number="5-1/2025", article="12.8", hearing=Hearing(raw="12.03.2025 14:30"))
+    assert a.dedup_key == same.dedup_key

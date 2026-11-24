@@ -29,10 +29,16 @@ class ScraperConfig:
     screenshot_on_error: bool = True
     # vision-модель как «тяжёлая артиллерия», если локальный OCR не справляется
     captcha_vision_enabled: bool = True
-    captcha_vision_model: str = "gpt-4o-mini"
+    captcha_vision_model: str = "gpt://<folder_id>/qwen2.5-vl-32b-instruct/latest"
     captcha_vision_base_url: str = "https://api.openai.com/v1"
     captcha_vision_auth_scheme: str = "bearer"  # bearer | api-key (Yandex API-ключ)
     captcha_vision_folder_id: str = ""  # Yandex Cloud: id каталога (x-folder-id)
+    captcha_vision_max_tokens: int = 512  # запас на reasoning-модели
+    captcha_vision_reasoning_effort: str = "none"  # none отключает reasoning (быстрее)
+    # авто-перезагрузка при ошибке 500 на странице участка
+    retry_on_500: bool = True
+    max_500_reloads: int = 5
+    output_excel: str = "data/cases.xlsx"
 
 
 @dataclass
@@ -98,8 +104,7 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         captcha_max_attempts=int(scraper_raw.get("captcha_max_attempts", 8)),
         screenshot_on_error=bool(scraper_raw.get("screenshot_on_error", True)),
         captcha_vision_enabled=bool(scraper_raw.get("captcha_vision_enabled", True)),
-        captcha_vision_model=str(scraper_raw.get("captcha_vision_model", "gpt-4o-mini")),
-        captcha_vision_base_url=str(
+        captcha_vision_model=str(scraper_raw.get("captcha_vision_model", "gpt-4o-mini")),        captcha_vision_base_url=str(
             scraper_raw.get("captcha_vision_base_url", "https://api.openai.com/v1")
         ),
         captcha_vision_auth_scheme=str(
@@ -108,6 +113,16 @@ def load_settings(config_path: str | Path | None = None, env_path: str | Path | 
         captcha_vision_folder_id=str(
             scraper_raw.get("captcha_vision_folder_id", "")
             or os.getenv("YANDEX_FOLDER_ID", "")
+        ),
+        captcha_vision_max_tokens=int(scraper_raw.get("captcha_vision_max_tokens", 512)),
+        captcha_vision_reasoning_effort=str(
+            scraper_raw.get("captcha_vision_reasoning_effort", "none")
+        ).lower(),
+        retry_on_500=bool(scraper_raw.get("retry_on_500", True)),
+        max_500_reloads=int(scraper_raw.get("max_500_reloads", 5)),
+        output_excel=str(
+            scraper_raw.get("output_excel", "")
+            or os.getenv("EXCEL_PATH", "data/cases.xlsx")
         ),
     )
 

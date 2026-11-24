@@ -149,10 +149,12 @@ def test_collect_precinct_urls_drops_portal_and_bare_msudrf():
     assert urls == ["http://5.perm.msudrf.ru/modules.php?name=sud_delo"]
 
 
-def test_clean_ocr_code_keeps_alnum():
+def test_clean_ocr_code_keeps_cyrillic_only():
     from src.scraper import _clean_ocr_code
 
-    assert _clean_ocr_code(" aB-c1 2! ") == "aBc12"
+    assert _clean_ocr_code(" ПР-ив ет 1! ") == "ПРивет"
+    assert _clean_ocr_code("roze") == ""
+    assert _clean_ocr_code("пAвB") == "пв"
     assert _clean_ocr_code(None) == ""
     assert _clean_ocr_code("") == ""
 
@@ -172,9 +174,10 @@ def test_html_has_captcha_by_structure():
 def test_vote_codes_picks_most_frequent_then_longest():
     from src.scraper import _vote_codes
 
-    assert _vote_codes(["abcd", "abcf", "abcd"]) == "abcd"
-    assert _vote_codes(["abc", "ab", "abc"]) == "abc"
-    assert _vote_codes(["", None, "xy"]) == "xy"
+    assert _vote_codes(["абвг", "абвд", "абвг"]) == "абвг"
+    assert _vote_codes(["абв", "аб", "абв"]) == "абв"
+    assert _vote_codes(["", None, "ху"]) == "ху"
+    assert _vote_codes(["abcd", "abcf"]) == ""
     assert _vote_codes([]) == ""
 
 
@@ -257,3 +260,85 @@ def test_wait_for_case_form_returns_false_on_empty_skeleton():
 
 
 
+
+
+def test_html_is_500_detects_server_error():
+    from src.scraper import _html_is_500
+
+    assert _html_is_500("<h1>500 Internal Server Error</h1>") is True
+    assert _html_is_500("<title>Ошибка 500</title><body>Произошла ошибка</body>") is True
+    assert _html_is_500("<html><body>Список дел 5-1/2025</body></html>") is False
+    assert _html_is_500("") is False
+    assert _html_is_500(None) is False
+
+
+def test_recover_from_500_disabled():
+    s = _scraper()
+    s.cfg.retry_on_500 = False
+
+    class _P:
+        async def content(self):
+            return "500 Internal Server Error"
+
+    # при отключённой опции считаем, что всё в порядке (нечего чинить)
+    assert asyncio.run(s._recover_from_500(_P(), "test")) is True
+
+
+def test_recover_from_500_reloads_then_succeeds():
+    s = _scraper()
+    s.cfg.retry_on_500 = True
+    s.cfg.max_500_reloads = 3
+    s._pause = lambda: None
+
+    class _P:
+        url = "https://example.msudrf.ru/"
+
+        def __init__(self):
+            self.state = "500"
+            self.reloads = 0
+
+        async def content(self):
+            return "500 Internal Server Error" if self.state == "500" else "<table>ok</table>"
+
+        async def reload(self, wait_until="domcontentloaded"):
+            self.reloads += 1
+            self.state = "ok"
+
+    p = _P()
+    assert asyncio.run(s._recover_from_500(p, "test")) is True
+    assert p.reloads == 1
+
+
+def test_vision_empty_content_returns_none(monkeypatch):
+    import json as _json
+
+    from src import captcha_ai
+
+    class _Resp:
+        def __init__(self, body):
+            self._b = _json.dumps(body).encode()
+
+        def read(self):
+            return self._b
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    body = {
+        "choices": [
+            {"message": {"content": "", "reasoning_content": "..."}, "finish_reason": "length"}
+        ]
+    }
+    monkeypatch.setattr(captcha_ai.urllib.request, "urlopen", lambda *a, **k: _Resp(body))
+    assert captcha_ai.solve_captcha_vision(b"img", api_key="k") is None
+
+    ok = {"choices": [{"message": {"content": "роЗе"}, "finish_reason": "stop"}]}
+    monkeypatch.setattr(captcha_ai.urllib.request, "urlopen", lambda *a, **k: _Resp(ok))
+    assert captcha_ai.solve_captcha_vision(b"img", api_key="k") == "роЗе"
+
+    latin = {"choices": [{"message": {"content": "roZe"}, "finish_reason": "stop"}]}
+    monkeypatch.setattr(captcha_ai.urllib.request, "urlopen", lambda *a, **k: _Resp(latin))
+    assert captcha_ai.solve_captcha_vision(b"img", api_key="k") is None

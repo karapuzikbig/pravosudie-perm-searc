@@ -25,16 +25,22 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import urllib.error
 import urllib.request
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
+_RU_LETTERS = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+
 _PROMPT = (
-    "На картинке капча (KCAPTCHA): латинские буквы и цифры, искажённые волнами "
-    "и шумом. Верни ТОЛЬКО символы капчи без пробелов, знаков препинания и "
-    "пояснений. Если не уверен — верни наиболее вероятный вариант."
+    "На картинке капча (KCAPTCHA) из русских букв (кириллица), искажённых "
+    "волнами и шумом. Верни ТОЛЬКО русские буквы капчи в том регистре, в "
+    "каком они изображены, без пробелов, знаков препинания и пояснений. "
+    "Не заменяй русские буквы латинскими. Если не уверен — верни наиболее "
+    "вероятный вариант."
 )
+
 
 
 def solve_captcha_vision(
@@ -45,6 +51,8 @@ def solve_captcha_vision(
     base_url: str = "https://api.openai.com/v1",
     auth_scheme: str = "bearer",
     folder_id: str = "",
+    max_tokens: int = 512,
+    reasoning_effort: str = "none",
     timeout: float = 30.0,
 ) -> Optional[str]:
     """Отправить картинку капчи в vision-модель, вернуть распознанный код.
@@ -62,7 +70,10 @@ def solve_captcha_vision(
     payload = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 20,
+        # Небольшой лимит: ответ — только символы капчи. Но reasoning-моделям
+        # (например, Yandex Qwen) нужно место на «размышления», иначе content
+        # остаётся пустым.
+        "max_tokens": max_tokens,
         "messages": [
             {
                 "role": "user",
@@ -76,6 +87,11 @@ def solve_captcha_vision(
             }
         ],
     }
+    # Для распознавания капчи многошаговое рассуждение не нужно: отключаем,
+    # чтобы ответ приходил сразу в content (а не в reasoning_content) и не
+    # обрезался лимитом токенов. Yandex понимает "none" у Qwen3.6.
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     url = base_url.rstrip("/") + "/chat/completions"
     data = json.dumps(payload).encode("utf-8")
 
@@ -94,20 +110,46 @@ def solve_captcha_vision(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:  # noqa: BLE001
+            detail = ""
+        log.warning("Vision-модель ответила HTTP %s: %s", exc.code, detail)
+        return None
     except Exception as exc:  # noqa: BLE001
         log.warning("Vision-запрос к капче не удался: %s", exc)
         return None
 
+    choice = {}
     try:
-        text = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0] or {}
     except (KeyError, IndexError, TypeError):
-        log.warning("Неожиданный ответ vision-модели: %s", str(body)[:200])
+        log.warning("Неожиданный ответ vision-модели: %s", json.dumps(body, ensure_ascii=False)[:500])
         return None
+    message = choice.get("message") or {}
+    text = message.get("content") or ""
     if isinstance(text, list):
         text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-    code = "".join(ch for ch in (text or "") if ch.isalnum())
+    if not (text or "").strip():
+        # reasoning-модели кладут «размышления» отдельно, а content может быть
+        # пустым (обрезан лимитом или модель не поддерживает картинки).
+        reasoning = message.get("reasoning_content") or ""
+        finish = choice.get("finish_reason")
+        log.warning(
+            "Vision-модель вернула пустой ответ (finish_reason=%s, reasoning=%r). "
+            "Проверьте, что модель — vision (vl) и она поддерживает изображения.",
+            finish,
+            (reasoning or "")[:200],
+        )
+        return None
+    code = "".join(ch for ch in text if ch.lower() in _RU_LETTERS)
     if not code:
-        log.info("Vision-модель не вернула читаемых символов")
+        log.info(
+            "Vision-модель не вернула русских букв (ответ: %r); "
+            "капча состоит только из кириллицы",
+            text[:100],
+        )
         return None
     log.info("Vision-модель распознала капчу: «%s»", code)
     return code

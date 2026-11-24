@@ -32,7 +32,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .config import ScraperConfig, Settings
-from .parsers import Case, parse_case_html
+from .excel_export import append_cases
+from .parsers import Case, has_cases_table, parse_case_html
 
 log = logging.getLogger(__name__)
 
@@ -67,8 +68,17 @@ class CaptchaDetected(RuntimeError):
 
 
 def _clean_ocr_code(raw: str | None) -> str:
-    """Оставить в распознанном коде капчи только буквы и цифры."""
-    return "".join(ch for ch in (raw or "") if ch.isalnum())
+    """Оставить в распознанном коде капчи только русские буквы.
+
+    Капча на сайте участка состоит только из кириллицы. Латиницу и цифры
+    отбрасываем: ddddocr обучен на латинице и «выдумывает» их, поэтому
+    такие гипотезы всё равно неверны и только мешают голосованию.
+    """
+    return "".join(ch for ch in (raw or "") if ch.lower() in _RU_LETTERS)
+
+
+_RU_LETTERS = set("абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+
 
 
 def _html_has_captcha(html: str | None) -> bool:
@@ -90,6 +100,32 @@ def _html_has_captcha(html: str | None) -> bool:
     if any(m in low for m in markers):
         return True
     return "captcha.php" in low and "<img" in low
+
+
+# Признаки серверной ошибки 500 на страницах участков.
+ERROR_500_MARKERS = (
+    "500 internal server error",
+    "internal server error",
+    "http error 500",
+    "ошибка 500",
+    "ошибка сервера",
+    "500 ошибка",
+    "произошла ошибка",
+)
+
+
+def _html_is_500(html: str | None) -> bool:
+    """Похожа ли страница на ошибку 500 (а не на обычную выдачу/форму).
+
+    Проверяем и текст, и заголовок <title>: некоторые участки отдают
+    страницу ошибки с кодом 500 без единого «содержательного» текста.
+    """
+    if not html:
+        return False
+    low = html.lower()
+    if any(m in low for m in ERROR_500_MARKERS):
+        return True
+    return "500" in low and ("server error" in low or "ошибка сервера" in low)
 
 
 def _prepare_captcha_variants(img_bytes: bytes) -> list[bytes]:
@@ -323,13 +359,27 @@ class Scraper:
                     if dump:
                         await self._dump(page, f"after_submit_{idx:02d}")
                         await self._dump_text(page, f"after_submit_{idx:02d}")
-                    for _ in range(self.cfg.max_pages):
-                        if await self._has_captcha(page):
-                            await self._pass_captcha(page, dump)
-                        html = await page.content()
-                        for case in parse_case_html(html, url=page.url):
-                            if not case.article or case.matches_articles(wanted):
-                                collected.setdefault(case.uid, case)
+                    for page_no in range(1, self.cfg.max_pages + 1):
+                        html = await self._read_results_html(page, dump, site_url, page_no)
+                        if html is None:
+                            break
+                        if not has_cases_table(html):
+                            log.info(
+                                "На %s (стр. %d) нет таблицы дел — пропускаем",
+                                site_url,
+                                page_no,
+                            )
+                            break
+                        cases = parse_case_html(html, url=page.url)
+                        matching = [
+                            c for c in cases if not c.article or c.matches_articles(wanted)
+                        ]
+                        added = self._save_to_excel(matching)
+                        for case in matching:
+                            collected.setdefault(case.uid, case)
+                        log.info(
+                            "Стр. %d: дел=%d, новых в Excel=%d", page_no, len(matching), added
+                        )
                         if not await self._goto_next_page(page):
                             break
                     self._pause()
@@ -439,21 +489,68 @@ class Scraper:
         markers = ("доступ запрещен", "доступ запрещён", "403 forbidden", "error 403")
         return any(m in html for m in markers)
 
+    async def _is_server_error(self, page) -> bool:
+        """Страница отдала ошибку 500 (серверная ошибка, парсер «встаёт»)."""
+        try:
+            html = await page.content()
+        except Exception:  # noqa: BLE001
+            return False
+        return _html_is_500(html)
+
+    async def _recover_from_500(self, page, tag: str = "") -> bool:
+        """Если на странице ошибка 500 — перезагрузить её до восстановления.
+
+        Сайты участков периодически отдают 500, после чего парсер повисал до
+        ручной перезагрузки страницы. Здесь автоматически перезагружаем
+        страницу (с растущей паузой) до ``max_500_reloads`` раз, пока не
+        вернётся нормальная страница. Возвращает True, если 500 устранена
+        (или её не было).
+        """
+        if not self.cfg.retry_on_500:
+            return True
+        if not await self._is_server_error(page):
+            return True
+        attempts = max(1, self.cfg.max_500_reloads)
+        for attempt in range(1, attempts + 1):
+            log.warning(
+                "Ошибка 500 на странице %s%s — перезагрузка (%d/%d)",
+                page.url,
+                f" [{tag}]" if tag else "",
+                attempt,
+                attempts,
+            )
+            self._pause()
+            try:
+                await page.reload(wait_until="domcontentloaded")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Не удалось перезагрузить страницу после 500: %s", exc)
+            # дать JS дорисовать страницу, затем проверить, ушла ли ошибка
+            await asyncio.sleep(min(2.0 * attempt, 8.0))
+            if not await self._is_server_error(page):
+                log.info("Страница восстановилась после 500 (попытка %d)", attempt)
+                return True
+        log.error("Ошибка 500 не ушла после %d перезагрузок: %s", attempts, page.url)
+        return False
+
     async def _open_site_with_retry(self, page, site_url: str, dump: bool) -> bool:
         """Открыть главную сайта участка, при блокировке — пауза и повтор."""
-        for attempt in (1, 2):
+        for attempt in (1, 4):
             try:
                 await page.goto(site_url, wait_until="domcontentloaded")
             except Exception as exc:  # noqa: BLE001
                 log.warning("Не открылся %s (попытка %d): %s", site_url, attempt, exc)
                 self._pause()
                 continue
-            if not await self._is_blocked(page):
-                return True
-            log.warning("403 на %s (попытка %d)", site_url, attempt)
-            if dump and attempt == 1:
-                await self._dump(page, "blocked_site")
-            self._pause()
+            if await self._is_blocked(page):
+                log.warning("403 на %s (попытка %d)", site_url, attempt)
+                if dump and attempt == 1:
+                    await self._dump(page, "blocked_site")
+                self._pause()
+                continue
+            # сайт мог отдать 500 — перезагружаем до восстановления
+            if not await self._recover_from_500(page, "site"):
+                return False
+            return True
         return False
 
     async def _open_case_search_on_site(self, page, site_url: str, dump: bool) -> bool:
@@ -471,6 +568,9 @@ class Scraper:
             return False
         if await self._is_blocked(page):
             log.warning("403 на модуле дел %s", site_url)
+            return False
+        # модуль дел мог ответить 500 — перезагружаем автоматически
+        if not await self._recover_from_500(page, "delo"):
             return False
         # модуль может сразу выдать капчу («дополнительную проверку»)
         if await self._has_captcha(page):
@@ -536,9 +636,10 @@ class Scraper:
     async def _auto_solve_captcha(self, page, dump: bool) -> bool:
         """Распознать KCAPTCHA: сначала локально (ddddocr), затем vision-модель.
 
-        Локальный OCR бесплатный и быстрый, поэтому пробуем его первым. Если
-        он недоступен, несколько раз подряд не дал уверенного кода или сервер
-        отверг распознанное — подключаем vision-модель (если задан ключ).
+        Капча сайта состоит только из русских букв (кириллица). ddddocr
+        обучен на латинице, поэтому его русские чтения почти всегда
+        отфильтровываются как пустые — тогда сразу подключаем vision-модель
+        (если задан ключ). Локальный OCR оставляем как дешёвую первую попытку.
         """
         ocr = None
         try:
@@ -630,6 +731,8 @@ class Scraper:
             base_url=self.cfg.captcha_vision_base_url,
             auth_scheme=self.cfg.captcha_vision_auth_scheme,
             folder_id=self.cfg.captcha_vision_folder_id,
+            max_tokens=self.cfg.captcha_vision_max_tokens,
+            reasoning_effort=self.cfg.captcha_vision_reasoning_effort,
         )
         if not code:
             return []
@@ -960,6 +1063,31 @@ class Scraper:
             await page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:  # noqa: BLE001
             pass
+        await self._log_search_results(page)
+
+    async def _log_search_results(self, page) -> None:
+        """Залогировать, что реально оказалось в блоке результатов после поиска."""
+        try:
+            text = await page.evaluate(
+                """() => {
+                    const r = document.querySelector('#search_results');
+                    if (!r) return null;
+                    const tables = r.querySelectorAll('table').length;
+                    return {tables, text: (r.innerText || '').slice(0, 300)};
+                }"""
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("После поиска не удалось прочитать #search_results")
+            return
+        if text is None:
+            log.warning("После поиска блок #search_results не найден на странице")
+            return
+        snippet = (text.get("text") or "").strip().replace("\n", " ")
+        log.info(
+            "Результат поиска: таблиц=%s, текст=%r",
+            text.get("tables"),
+            snippet,
+        )
 
     async def _select_key(self, select) -> str | None:
         """Определить назначение <select> по подписи/опциям/имени."""
@@ -1051,6 +1179,43 @@ class Scraper:
             except Exception:  # noqa: BLE001
                 continue
         return False
+
+    def _save_to_excel(self, cases: list[Case]) -> int:
+        """Дописать пачку дел в общий Excel-файл (по одной строке на дело)."""
+        if not cases:
+            return 0
+        try:
+            return append_cases(self.cfg.output_excel, cases)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось записать дела в Excel (%s)", self.cfg.output_excel)
+            return 0
+
+    async def _read_results_html(
+        self, page, dump: bool, site_url: str, page_no: int
+    ) -> str | None:
+        """Прочитать HTML текущей страницы выдачи, пережив капчу и ошибку 500.
+
+        Возвращает HTML или None, если страницу восстановить не удалось.
+        """
+        if await self._has_captcha(page):
+            await self._pass_captcha(page, dump)
+            if await self._has_captcha(page):
+                log.warning("Капча на %s (стр. %d) не пройдена", site_url, page_no)
+                return None
+        if not await self._recover_from_500(page, f"results p{page_no}"):
+            if dump:
+                await self._dump(page, f"error500_{page_no:02d}")
+            log.warning("Ошибка 500 на %s (стр. %d) не устранена", site_url, page_no)
+            return None
+        # после перезагрузки могла снова потребоваться капча
+        if await self._has_captcha(page):
+            await self._pass_captcha(page, dump)
+            if await self._has_captcha(page):
+                return None
+        try:
+            return await page.content()
+        except Exception:  # noqa: BLE001
+            return None
 
 
 async def _run_debug(headful: bool = False, articles: list[str] | None = None, dump: bool = False) -> int:

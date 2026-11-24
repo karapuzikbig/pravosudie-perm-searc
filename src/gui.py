@@ -11,6 +11,7 @@ import queue
 import threading
 import tkinter as tk
 import webbrowser
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 from .config import Settings, parse_articles
@@ -94,6 +95,11 @@ class App(tk.Tk):
         )
         self.open_btn.pack(side="right")
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.open_btn.configure(state="normal"))
+
+        self.excel_btn = ttk.Button(
+            bottom, text="Открыть Excel", command=self._on_open_excel
+        )
+        self.excel_btn.pack(side="right", padx=(0, 8))
 
         hint = ttk.Label(
             self,
@@ -194,6 +200,16 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         self.destroy()
+
+    def _on_open_excel(self) -> None:
+        path = Path(self.settings.scraper.output_excel).resolve()
+        if not path.exists():
+            messagebox.showinfo(
+                "Excel пока нет",
+                f"Файл ещё не создан: {path}\nОн появится после первого найденного дела.",
+            )
+            return
+        webbrowser.open(path.as_uri(), new=2)
 
 
 def run(settings: Settings | None = None) -> None:
