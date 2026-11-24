@@ -32,11 +32,39 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 _PROMPT = (
-    "На картинке капча (KCAPTCHA): РУССКИЕ строчные буквы (кириллица), искажённые "
-    "волнами и шумом. Верни ТОЛЬКО эти русские буквы без пробелов, знаков "
-    "препинания, цифр и пояснений. Не заменяй русские буквы похожими латинскими — "
-    "пиши именно кириллицей. Если не уверен — верни наиболее вероятный вариант."
+    "Распознай текст на капче. Отвечай ОДНИМ словом — только символами капчи, "
+    "без рассуждений, пробелов и пояснений. Капча состоит из строчных РУССКИХ "
+    "букв (кириллица), искажённых волнами и шумом. Например: «ажур». "
+    "Не заменяй русские буквы латинскими. Не пиши ничего, кроме ответа."
 )
+
+
+def _build_payload(prompt: str, img_bytes: bytes, model: str) -> dict:
+    """Собрать тело запроса к OpenAI-совместимому vision-API.
+
+    Для reasoning-моделей (Qwen3 и т.п.) отключаем «размышления» и даём
+    запас токенов, иначе ответ обрезается (finish_reason=length, content=null).
+    """
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    return {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 1000,
+        "reasoning_effort": "none",
+        "thinking": {"type": "disabled"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+    }
 
 # Код капчи портала — короткое «слово» из букв/цифр (по наблюдениям капча на
 # портале состоит из строчных РУССКИХ букв). Разрешаем и кириллицу, и латиницу:
@@ -106,25 +134,7 @@ def solve_captcha_vision(
         return None
     if not img_bytes:
         return None
-
-    b64 = base64.b64encode(img_bytes).decode("ascii")
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "max_tokens": 300,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}"},
-                    },
-                ],
-            }
-        ],
-    }
+    payload = _build_payload(_PROMPT, img_bytes, model)
     url = base_url.rstrip("/") + "/chat/completions"
     data = json.dumps(payload).encode("utf-8")
 
@@ -172,10 +182,6 @@ def solve_captcha_vision(
     text = msg.get("content")
     if isinstance(text, list):
         text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-    # reasoning-модели (Qwen3 и др.) могут вернуть пустой content, а ответ —
-    # в reasoning_content; берём его как запасной вариант.
-    if not text:
-        text = msg.get("reasoning_content") or ""
     log.info(
         "Vision-модель ответила: %r (finish=%s, usage=%s)",
         (text or "")[:200],
@@ -201,24 +207,7 @@ def probe_vision(
     timeout: float = 30.0,
 ) -> None:
     """Отправить капчу в модель и напечатать СЫРОЙ ответ/ошибку (для отладки)."""
-    b64 = base64.b64encode(img_bytes).decode("ascii")
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "max_tokens": 300,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}"},
-                    },
-                ],
-            }
-        ],
-    }
+    payload = _build_payload(_PROMPT, img_bytes, model)
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
         "Content-Type": "application/json",
