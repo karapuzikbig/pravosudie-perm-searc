@@ -38,6 +38,41 @@ _PROMPT = (
     "пиши именно кириллицей. Если не уверен — верни наиболее вероятный вариант."
 )
 
+# Код капчи портала — короткое «слово» из букв/цифр (по наблюдениям капча на
+# портале состоит из строчных РУССКИХ букв). Разрешаем и кириллицу, и латиницу:
+# модель иногда отвечает латиницей вместо похожих русских букв.
+_ALLOWED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+)
+_WORD = "".join(sorted(_ALLOWED))
+_NOISE_WORDS = {
+    "капча", "картинке", "картинка", "код", "буквы", "буква", "символы", "символ",
+    "русские", "кириллица", "текст", "ответ", "изображение", "изображении",
+}
+
+
+def extract_code(text: str | None) -> str:
+    """Извлечь код капчи из ответа модели.
+
+    Ищем короткое слово (4–8 символов) из букв/цифр; отбрасываем служебные
+    русские слова («капча», «буквы»…), которые модель может дописать.
+    """
+    import re  # noqa: PLC0415
+
+    if not text:
+        return ""
+    text = text.strip()
+    for pattern in (
+        rf"[«\"'“]([{_WORD}]{{2,8}})[»\"'”]",
+        rf"\b([{_WORD}]{{4,8}})\b",
+    ):
+        for m in re.finditer(pattern, text):
+            cand = m.group(1)
+            if cand.lower() not in _NOISE_WORDS:
+                return cand
+    return "".join(ch for ch in text if ch in _ALLOWED)
+
 
 def solve_captcha_vision(
     img_bytes: bytes,
@@ -123,7 +158,8 @@ def solve_captcha_vision(
         return None
     if isinstance(text, list):
         text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-    code = "".join(ch for ch in (text or "") if ch.isalnum())
+    log.info("Vision-модель ответила: %r", (text or "")[:200])
+    code = extract_code(text)
     if not code:
         log.info("Vision-модель не вернула читаемых символов")
         return None
