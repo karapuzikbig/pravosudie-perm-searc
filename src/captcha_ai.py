@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import urllib.error
 import urllib.request
 from typing import Optional
 
@@ -94,6 +95,22 @@ def solve_captcha_vision(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # тело ответа обычно содержит причину (особенно у Yandex Cloud)
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            detail = ""
+        log.warning(
+            "Vision-запрос к капче не удался: HTTP %s %s. auth_scheme=%s, "
+            "модель=%s. Ответ: %s",
+            exc.code,
+            exc.reason,
+            auth_scheme,
+            model,
+            detail[:500] or "(пусто)",
+        )
+        return None
     except Exception as exc:  # noqa: BLE001
         log.warning("Vision-запрос к капче не удался: %s", exc)
         return None
