@@ -354,3 +354,46 @@ def test_ddddocr_disabled_by_default():
     from src.config import ScraperConfig
 
     assert ScraperConfig().captcha_use_ddddocr is False
+
+
+def test_open_case_search_no_form_branch_does_not_await_sync_pause(monkeypatch):
+    # регрессия: _pause синхронная, после капчи без формы её звали через await,
+    # из-за чего участок падал с "object NoneType can't be used in 'await' expression"
+    s = _scraper()
+    monkeypatch.setattr(s, "cfg", type(s.cfg)(delay_min_between_requests=0, delay_max_between_requests=0))
+
+    async def _not_blocked(_page):
+        return False
+
+    async def _no_captcha(_page):
+        return False
+
+    async def _no_form(_page):
+        return False
+
+    async def _no_links(_page, _texts):
+        return False
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(s, "_is_blocked", _not_blocked)
+    monkeypatch.setattr(s, "_has_captcha", _no_captcha)
+    monkeypatch.setattr(s, "_page_has_form", _no_form)
+    monkeypatch.setattr(s, "_click_link_texts", _no_links)
+    monkeypatch.setattr(s, "_dump", _noop)
+    monkeypatch.setattr(s, "_open_site_with_retry", lambda *_a, **_k: _true())
+
+    class _Page:
+        async def goto(self, *_a, **_k):
+            return None
+
+        async def content(self):
+            return "<html></html>"
+
+    result = asyncio.run(s._open_case_search_on_site(_Page(), "http://1.perm.msudrf.ru", False))
+    assert result is False
+
+
+async def _true():
+    return True

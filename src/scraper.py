@@ -524,7 +524,7 @@ class Scraper:
         if await self._has_captcha(page):
             await self._pass_captcha(page, dump)
         if not await self._page_has_form(page):
-            await self._pause()
+            self._pause()
             if await self._click_link_texts(
                 page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
             ):
