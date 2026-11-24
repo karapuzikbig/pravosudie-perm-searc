@@ -267,6 +267,18 @@ class Scraper:
                         if dump:
                             await self._dump(page, f"captcha_skip_{idx:02d}")
                         continue
+                    # после капчи страница может быть пустым JS-скелетом:
+                    # ждём, пока отрисуется форма дел, иначе капча вернётся снова
+                    if not await self._wait_for_case_form(page, timeout_ms=15000):
+                        log.warning("Форма дел на %s не отрисовалась вовремя", site_url)
+                        if dump:
+                            await self._dump(page, f"form_timeout_{idx:02d}")
+                        continue
+                    if await self._has_captcha(page):
+                        await self._pass_captcha(page, dump)
+                        if await self._has_captcha(page):
+                            log.warning("Капча на %s не пройдена, пропускаю участок", site_url)
+                            continue
                     try:
                         await self._fill_and_submit(page, wanted, dump)
                     except Exception:  # noqa: BLE001
@@ -606,6 +618,9 @@ class Scraper:
         await self._submit_captcha(page)
         ok = await self._wait_captcha_gone(page, timeout_ms=8000)
         if ok:
+            # форма дел дорисовывается JS уже после капчи — дождёмся её,
+            # иначе сразу после «после капчи» страница ещё пустой скелет
+            await self._wait_for_case_form(page, timeout_ms=15000)
             if dump:
                 await self._dump(page, "after_captcha")
             return True
@@ -670,18 +685,60 @@ class Scraper:
         когда старый DOM уже открепился, а новый ещё не отрисовался — это
         ложно трактовалось как «капча пройдена».
         """
+        return await self._poll_until(page, lambda: self._captcha_absent(page), timeout_ms)
+
+    async def _captcha_absent(self, page) -> bool:
+        return not await self._has_captcha(page)
+
+    async def _poll_until(self, page, predicate, timeout_ms: int) -> bool:
+        """Ждать, пока ``predicate(page)`` вернёт True два раза подряд.
+
+        ``predicate`` — корутинная функция, уже привязанная к ``page``; параметр
+        ``page`` оставлен для единообразия вызовов и в проверку не передаётся.
+
+        Двойное подтверждение с паузой защищает от ложного срабатывания в
+        момент перезагрузки/перерисовки страницы (старый DOM открепился, новый
+        ещё не отрисован).
+        """
         step_ms = 500
         waited = 0
         misses = 0
-        while waited < timeout_ms:
-            if await self._has_captcha(page):
-                misses = 0
-            else:
-                misses += 1
-                if misses >= 2:
-                    return True
+        while True:
+            try:
+                ok = bool(await predicate())
+            except Exception:  # noqa: BLE001
+                ok = False
+            misses = misses + 1 if ok else 0
+            if misses >= 2:
+                return True
+            if waited >= timeout_ms:
+                return False
             await asyncio.sleep(step_ms / 1000)
             waited += step_ms
+
+    async def _wait_for_case_form(self, page, timeout_ms: int) -> bool:
+        """Дождаться, пока страница участка отрисует форму дел после капчи.
+
+        После прохождения капчи сервер отдаёт «скелет» страницы: ``<body>``
+        пуст, разметку дорисовывает JS. Если сразу лезть в форму, её ещё нет,
+        и сайт снова требует капчу. Поэтому ждём появления характерных узлов:
+        вкладки административных дел, контента ``#bookmark_type_2``, поля
+        статьи или блока кнопок поиска.
+        """
+        return await self._poll_until(page, lambda: self._case_form_ready(page), timeout_ms)
+
+    async def _case_form_ready(self, page) -> bool:
+        try:
+            for sel in (
+                "#bookmark_type_2",
+                "li#type_2",
+                "#button_block",
+                'input[name="ADM_PARTS__LAW_ARTICLE"]',
+            ):
+                if await page.locator(sel).count() > 0:
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
         return False
 
     async def _reload_captcha(self, page) -> None:
@@ -763,6 +820,8 @@ class Scraper:
         Статья — это autocomplete-поле .select-values; проще всего ввести текст
         статьи и подтвердить значение.
         """
+        # форма могла ещё не отрисоваться после капчи (JS-скелет) — подождём
+        await self._wait_for_case_form(page, timeout_ms=15000)
         await self._open_admin_tab(page)
 
         date_from = self._date_window()

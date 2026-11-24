@@ -192,3 +192,68 @@ def test_vision_solver_no_key_returns_none():
     assert solve_captcha_vision(b"", api_key="k") is None
 
 
+class _ScriptedPage:
+    """page-заглушка: каждая проверка возвращает очередное значение."""
+
+    def __init__(self, values):
+        self._values = list(values)
+        self.calls = 0
+
+    async def probe(self):
+        self.calls += 1
+        return self._values.pop(0) if self._values else self._values_last
+
+    _values_last = False
+
+
+def test_poll_until_requires_two_consecutive_hits():
+    s = _scraper()
+    # False, True, False, True, True → успех только на 5-й проверке
+    page = _ScriptedPage([False, True, False, True, True])
+    ok = asyncio.run(s._poll_until(page, page.probe, timeout_ms=10000))
+    assert ok is True
+    assert page.calls == 5
+
+
+def test_poll_until_times_out_when_never_stable():
+    s = _scraper()
+    # True чередуется с False — два подряд так и не набираются
+    page = _ScriptedPage([True, False] * 100)
+    ok = asyncio.run(s._poll_until(page, page.probe, timeout_ms=1500))
+    assert ok is False
+
+
+def test_wait_for_case_form_detects_admin_tab():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(1 if sel in ("#bookmark_type_2", "li#type_2") else 0)
+
+    ok = asyncio.run(s._wait_for_case_form(_Page(), timeout_ms=1000))
+    assert ok is True
+
+
+def test_wait_for_case_form_returns_false_on_empty_skeleton():
+    s = _scraper()
+
+    class _Loc:
+        async def count(self):
+            return 0
+
+    class _Page:
+        def locator(self, _sel):
+            return _Loc()
+
+    ok = asyncio.run(s._wait_for_case_form(_Page(), timeout_ms=700))
+    assert ok is False
+
+
+
