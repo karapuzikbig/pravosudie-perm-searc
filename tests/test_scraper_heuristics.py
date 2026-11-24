@@ -211,6 +211,21 @@ def test_vision_solver_no_key_returns_none():
     assert solve_captcha_vision(b"", api_key="k") is None
 
 
+def test_vision_ocr_returns_single_code():
+    s = _scraper()
+    import src.captcha_ai as ai_mod
+
+    calls = iter(["абвгд", "абвгде"])
+    orig = ai_mod.solve_captcha_vision
+    ai_mod.solve_captcha_vision = lambda _img, **_kw: next(calls, "")
+    try:
+        code = s._vision_ocr(b"not-an-image")
+    finally:
+        ai_mod.solve_captcha_vision = orig
+    assert isinstance(code, str)
+    assert code != ""
+
+
 class _ScriptedPage:
     """page-заглушка: каждая проверка возвращает очередное значение."""
 

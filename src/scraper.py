@@ -712,14 +712,7 @@ class Scraper:
                 code = self._local_ocr(ocr, img_bytes, attempt, attempts)
             if not code and vision_allowed:
                 source = "vision"
-                for cand in self._vision_ocr(img_bytes):
-                    if await self._try_captcha_code(page, cand, dump):
-                        return True
-                # vision не помог — одна неудачная попытка, обновляем капчу
-                local_failures += 1
-                await self._reload_captcha(page)
-                self._pause()
-                continue
+                code = self._vision_ocr(img_bytes)
             if not code:
                 # локальный OCR пуст и vision недоступен — перерисовать капчу
                 if ocr is not None:
@@ -727,9 +720,13 @@ class Scraper:
                 await self._reload_captcha(page)
                 continue
 
+            # ВАЖНО: на одну картинку — ровно один ввод. После неудачной
+            # отправки сервер сразу перерисовывает капчу с новой картинкой,
+            # поэтому досылать остальные кандидаты (или варианты) нельзя —
+            # это и приводило к тому, что в новое поле уходил старый код.
             if await self._try_captcha_code(page, code, dump):
                 return True
-            log.info("Капча не принята (код «%s», %s), пробуем снова", code, source)
+            log.info("Капча не принята (код «%s», %s), обновляем картинку", code, source)
             local_failures += 1
             await self._reload_captcha(page)
             self._pause()
@@ -758,18 +755,19 @@ class Scraper:
         )
         return code
 
-    def _vision_ocr(self, img_bytes: bytes) -> list[str]:
-        """Спросить vision-модель; вернуть список кандидатов (возможно пустой).
+    def _vision_ocr(self, img_bytes: bytes) -> str:
+        """Спросить vision-модель; вернуть единственный лучший код (или "").
 
         Модель ошибается на отдельных буквах, поэтому опрашиваем её на
         нескольких вариантах картинки (оригинал + очищенная KCAPTCHA) и
-        принимаем решение голосованием. Возвращаем кандидатов по убыванию
-        «уверенности» — сначала самый частый ответ.
+        берём согласованный ответ. Возвращаем ровно один код: на одну
+        картинку допустим только один ввод, иначе после неудачной отправки
+        (сервер уже сменил капчу) следующий кандидат уйдёт в НОВОЕ поле.
         """
         try:
             from .captcha_ai import solve_captcha_vision  # noqa: PLC0415
         except Exception:  # noqa: BLE001
-            return []
+            return ""
 
         imgs = [img_bytes]
         cleaned = _clean_captcha_for_vision(img_bytes)
@@ -792,29 +790,11 @@ class Scraper:
                 readings.append(code)
 
         if not readings:
-            return []
-
-        # голосование: самый частый ответ первым, затем остальные без повторов
-        from collections import Counter  # noqa: PLC0415
-
-        ordered: list[str] = []
-        counts = Counter(readings)
+            return ""
         consensus = _vote_codes(readings)
-        if consensus:
-            ordered.append(consensus)
-        for code, _n in counts.most_common():
-            if code not in ordered:
-                ordered.append(code)
-        if len(counts) > 1:
-            log.info("Vision-модель: разные прочтения %s → голосование «%s»", readings, consensus)
-
-        # Регистр на вводе применяется отдельно (_apply_input_case), поэтому
-        # здесь возвращаем только разные прочтения, без вариантов lower/upper.
-        variants: list[str] = []
-        for code in ordered[:2]:
-            if code not in variants:
-                variants.append(code)
-        return variants
+        if len(set(readings)) > 1:
+            log.info("Vision-модель: прочтения %s → выбрано «%s»", readings, consensus)
+        return consensus
 
     def _apply_input_case(self, code: str) -> str:
         """Привести распознанный код к регистру, который принимает поле.
