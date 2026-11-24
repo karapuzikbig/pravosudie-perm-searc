@@ -316,7 +316,7 @@ class Scraper:
                     # капча могла появиться/не пройти на шаге открытия сайта
                     if await self._has_captcha(page):
                         await self._pass_captcha(page, dump)
-                    if await self._has_captcha(page):
+                    if await self._captcha_field_present(page):
                         log.warning("Капча на %s не пройдена, пропускаю участок", site_url)
                         if dump:
                             await self._dump(page, f"captcha_skip_{idx:02d}")
@@ -330,7 +330,7 @@ class Scraper:
                         continue
                     if await self._has_captcha(page):
                         await self._pass_captcha(page, dump)
-                        if await self._has_captcha(page):
+                        if await self._captcha_field_present(page):
                             log.warning("Капча на %s не пройдена, пропускаю участок", site_url)
                             continue
                     try:
@@ -508,18 +508,36 @@ class Scraper:
         # модуль может сразу выдать капчу («дополнительную проверку»)
         if await self._has_captcha(page):
             await self._pass_captcha(page, dump)
-        if await self._page_has_form(page):
-            return True
-        await self._pause()
-        if await self._click_link_texts(
-            page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
-        ):
-            if await self._has_captcha(page):
-                await self._pass_captcha(page, dump)
-            return await self._page_has_form(page)
-        if dump:
-            await self._dump(page, "site_no_form")
-        return False
+        if not await self._page_has_form(page):
+            await self._pause()
+            if await self._click_link_texts(
+                page, ("судебное делопроизводство", "поиск дел", "назначенные к рассмотрению")
+            ):
+                if await self._has_captcha(page):
+                    await self._pass_captcha(page, dump)
+                return await self._page_has_form(page)
+            if dump:
+                await self._dump(page, "site_no_form")
+            return False
+        # страница с формой на месте. Если это пустой JS-скелет после капчи,
+        # сама форма отрисуется позже — этим занимается вызывающий код
+        # (_wait_for_case_form), поэтому здесь возвращаем успех, чтобы участок
+        # не помечался «не открылся» сразу после принятой капчи.
+        return True
+
+    async def _captcha_field_present(self, page) -> bool:
+        """Стоит ли сейчас на странице поле ввода капчи (надёжнее, чем форма)."""
+        try:
+            if await page.locator('input[name="captcha-response"]').count() > 0:
+                return True
+            if await page.locator("#kcaptchaForm").count() > 0:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return _html_has_captcha(await page.content())
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _has_captcha(self, page) -> bool:
         """Капча определяется только по реальным элементам формы ввода.
@@ -556,14 +574,25 @@ class Scraper:
         """Пройти капчу: авто (ddddocr) с ретраями либо ручной ввод."""
         await self._screenshot(page, "captcha")
         if self.cfg.captcha_mode == "auto":
-            try:
-                if await self._auto_solve_captcha(page, dump):
+            # даём авто-решателю до двух полных заходов: поле капчи может
+            # «проскочить» на мгновение при перерисовке, а затем вернуться
+            for attempt in range(2):
+                try:
+                    solved = await self._auto_solve_captcha(page, dump)
+                except CaptchaDetected:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "Авто-решение капчи не удалось (%s), переходим к ручному вводу", exc
+                    )
+                    break
+                if solved and not await self._captcha_field_present(page):
                     log.info("Капча решена автоматически")
                     return
-            except CaptchaDetected:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Авто-решение капчи не удалось (%s), переходим к ручному вводу", exc)
+                if not solved and not await self._captcha_field_present(page):
+                    log.info("Капча исчезла после попыток — считаем пройденной")
+                    return
+                log.info("Поле капчи всё ещё на странице — повторяю авто-решение")
         await self._manual_captcha(page, dump)
 
     async def _auto_solve_captcha(self, page, dump: bool) -> bool:
@@ -575,20 +604,21 @@ class Scraper:
         картинка устаревает (сервер рисует новую), поэтому следующий кандидат
         проверяем уже на новой картинке.
         """
+        # ddddocr как запасной кандидат: на кириллической капче он читает
+        # латиницей, и его приблизительные коды только засоряют перебор.
+        # По умолчанию не используем (ленивая инициализация — долгая).
         ocr = None
-        try:
-            import ddddocr  # noqa: PLC0415
-            from ddddocr import charsets  # noqa: PLC0415
+        if getattr(self.cfg, "captcha_use_ddddocr", False):
+            try:
+                import ddddocr  # noqa: PLC0415
+                from ddddocr import charsets  # noqa: PLC0415
 
-            # ddddocr умеет только латиницу/знаки. Капча же — одни русские
-            # буквы, поэтому ограничиваем алфавит латиницей (её затем переводим
-            # в кириллицу) — модель перестанет лепить цифры и прочий мусор.
-            ocr = ddddocr.DdddOcr(show_ad=False)
-            latin = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            if all(ch in charsets.CHARSET_OLD for ch in latin):
-                ocr.ocr_engine.set_charset_range(latin)
-        except Exception:  # noqa: BLE001
-            log.info("ddddocr недоступен — полагаемся на vision-модель")
+                ocr = ddddocr.DdddOcr(show_ad=False)
+                latin = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                if all(ch in charsets.CHARSET_OLD for ch in latin):
+                    ocr.ocr_engine.set_charset_range(latin)
+            except Exception:  # noqa: BLE001
+                log.info("ddddocr недоступен — полагаемся на vision-модель")
         if not await self._has_captcha(page):
             return True
 

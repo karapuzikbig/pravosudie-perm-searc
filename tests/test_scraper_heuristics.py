@@ -313,3 +313,44 @@ def test_captcha_solved_false_when_input_still_there_and_no_form():
 
 
 
+def test_captcha_field_present_true_when_input_there():
+    s = _scraper()
+
+    class _Loc:
+        def __init__(self, n):
+            self._n = n
+
+        async def count(self):
+            return self._n
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc(1 if sel == 'input[name="captcha-response"]' else 0)
+
+        async def content(self):
+            return '<input name="captcha-response">'
+
+    assert asyncio.run(s._captcha_field_present(_Page())) is True
+
+
+def test_captcha_field_present_false_when_skeleton_without_captcha():
+    s = _scraper()
+
+    class _Loc:
+        async def count(self):
+            return 0
+
+    class _Page:
+        def locator(self, sel):
+            return _Loc()
+
+        async def content(self):
+            return "<html><body><div id='app'></div></body></html>"
+
+    assert asyncio.run(s._captcha_field_present(_Page())) is False
+
+
+def test_ddddocr_disabled_by_default():
+    from src.config import ScraperConfig
+
+    assert ScraperConfig().captcha_use_ddddocr is False

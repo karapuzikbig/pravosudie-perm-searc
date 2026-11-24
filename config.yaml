@@ -34,6 +34,7 @@ scraper:
   max_pages: 20             # предохранитель от зацикливания пагинации
   captcha_mode: "auto"      # auto — распознавать капчу (ddddocr) с ретраями; manual — вводить вручную
   captcha_max_attempts: 8   # сколько раз пробовать распознать капчу за один заход
+  captcha_use_ddddocr: false # ddddocr как запасной кандидат (на кириллице почти бесполезен)
   captcha_wait_seconds: 120 # сколько ждать ручного ввода капчи (режим manual / запасной)
   # Vision-модель — «тяжёлая артиллерия», если локальный OCR (ddddocr) не справляется.
   # Нужен ключ в .env: VISION_API_KEY (или OPENAI_API_KEY). Работает по OpenAI-
