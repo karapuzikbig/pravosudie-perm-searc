@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    container_name: pravosudie-gui
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
