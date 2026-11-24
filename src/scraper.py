@@ -475,10 +475,25 @@ class Scraper:
             return False
         # настоящий адрес модуля дел: /modules.php?name=sud_delo&op=hl
         delo_url = site_url.rstrip("/") + "/modules.php?name=sud_delo&op=hl"
-        try:
-            await page.goto(delo_url, wait_until="domcontentloaded")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не открылся модуль дел на %s: %s", site_url, exc)
+        opened = False
+        for attempt in range(2):
+            try:
+                await page.goto(
+                    delo_url,
+                    wait_until="domcontentloaded",
+                    timeout=max(self.cfg.timeout_ms, 60000),
+                )
+                opened = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Не открылся модуль дел на %s (попытка %d/2): %s",
+                    site_url,
+                    attempt + 1,
+                    exc,
+                )
+                self._pause()
+        if not opened:
             return False
         if await self._is_blocked(page):
             log.warning("403 на модуле дел %s", site_url)
