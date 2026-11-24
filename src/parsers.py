@@ -19,6 +19,14 @@ from bs4 import BeautifulSoup
 DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")
 TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})(?::\d{2})?\b")
 ARTICLE_RE = re.compile(r"\b(\d{1,2}\.\d{1,2}(?:\.\d{1,3})?)\s*(?:ч\.?\s*\d+)?\s*КоАП", re.IGNORECASE)
+# Статья в «Информация по делу»: «ст. 12.8 ч. 1», «ст. 6.1.1» (без слова КоАП).
+# Номер статьи может быть двух- или трёхуровневым (6.1.1, 15.33.2).
+ARTICLE_ST_RE = re.compile(
+    r"\bст\.?\s*(\d{1,2}\.\d{1,2}(?:\.\d{1,3})?)(?:\s*ч\.?\s*\d+)?",
+    re.IGNORECASE,
+)
+# Голый номер статьи вида 12.8 / 6.1.1 (последний резерв), но не часть даты.
+ARTICLE_BARE_RE = re.compile(r"\b(\d{1,2}\.\d{1,2}(?:\.\d{1,3})?)(?![.\d])")
 CASE_NUMBER_RE = re.compile(r"\b\d+[-\u2013]\d+/\d{4}\b")
 DISTRICT_RE = re.compile(r"(судебн\w+\s+участ\w*)\s*№?\s*(\d+)", re.IGNORECASE)
 HEARING_HEADER_KEYS = ("заседани", "дата", "время", "назнач")
@@ -128,10 +136,15 @@ def parse_date(text: str) -> datetime | None:
 
 
 def extract_article(text: str) -> str:
-    m = ARTICLE_RE.search(text or "")
+    text = text or ""
+    m = ARTICLE_RE.search(text)
     if m:
         return m.group(1)
-    m = re.search(r"\b(\d{1,2}\.\d{1,2})\b", text or "")
+    # «ст. 12.8 ч. 1», «ст. 6.1.1» — основной формат колонки «Информация по делу»
+    m = ARTICLE_ST_RE.search(text)
+    if m:
+        return m.group(1)
+    m = ARTICLE_BARE_RE.search(text)
     return m.group(1) if m else ""
 
 

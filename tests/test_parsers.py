@@ -61,6 +61,16 @@ def test_extract_fields():
     assert extract_district(text) == "Судебный участок №5"
 
 
+def test_extract_article_from_info_column():
+    # Формат колонки «Информация по делу»: «… - ст. 12.8 ч. 1;» без слова КоАП.
+    assert extract_article("ПРАВОНАРУШЕНИЕ: Иванов И.И. - ст. 12.8 ч. 1;") == "12.8"
+    assert extract_article("ПРАВОНАРУШЕНИЕ: X - ст. 6.1.1;") == "6.1.1"
+    assert extract_article("ПРАВОНАРУШЕНИЕ: Y - ст. 15.33 ч. 2;") == "15.33"
+    assert extract_article("ПРАВОНАРУШЕНИЕ: Z - ст. 15.33.2 ч. 1;") == "15.33.2"
+    # дата не должна приниматься за статью
+    assert extract_article("5-751/2026 12.03.2025 без статьи") == ""
+
+
 def test_parse_table_html_with_links():
     cases = parse_case_html(TABLE_HTML, url="https://sudrf.ru/search")
     assert len(cases) == 2
