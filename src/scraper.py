@@ -36,6 +36,17 @@ from .parsers import Case, parse_case_html
 
 log = logging.getLogger(__name__)
 
+
+def _utf8_stream():
+    """Поток логов в UTF-8, чтобы кириллица не превращалась в кракозябры в Windows."""
+    import sys  # noqa: PLC0415
+
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+    return sys.stdout
+
 # Входная точка — главная портал ГАС «Правосудие».
 HOME_URL = "https://sudrf.ru/"
 
@@ -568,29 +579,27 @@ class Scraper:
                 return False
 
             code = ""
-            source = "ocr"
-            if ocr is not None and local_failures < 2:
+            if ocr is not None:
                 code = self._local_ocr(ocr, img_bytes, attempt, attempts)
-            if not code and vision_allowed:
-                source = "vision"
+            if code and await self._try_captcha_code(page, code, dump):
+                return True
+            if code:
+                log.info("Капча не принята (код «%s», ocr), пробуем снова", code)
+                local_failures += 1
+            # локальный OCR пуст или не принят — спрашиваем vision-модель
+            if vision_allowed:
                 for cand in self._vision_ocr(img_bytes):
+                    if cand == code:
+                        continue
                     if await self._try_captcha_code(page, cand, dump):
                         return True
-                # vision не помог — одна неудачная попытка, идём дальше
+                log.info("Vision-варианты не приняты, пробуем снова")
+            if not code and ocr is not None:
                 local_failures += 1
-                self._pause()
-                continue
-            if not code:
+            if not code and not vision_allowed:
                 # локальный OCR пуст и vision недоступен — перерисовать капчу
-                if ocr is not None:
-                    local_failures += 1
                 await self._reload_captcha(page)
                 continue
-
-            if await self._try_captcha_code(page, code, dump):
-                return True
-            log.info("Капча не принята (код «%s», %s), пробуем снова", code, source)
-            local_failures += 1
             self._pause()
         return False
 
@@ -1084,6 +1093,7 @@ def main() -> int:
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=_utf8_stream(),
     )
     from .config import parse_articles
 
