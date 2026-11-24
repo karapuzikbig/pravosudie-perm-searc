@@ -567,11 +567,13 @@ class Scraper:
         await self._manual_captcha(page, dump)
 
     async def _auto_solve_captcha(self, page, dump: bool) -> bool:
-        """Распознать KCAPTCHA: сначала локально (ddddocr), затем vision-модель.
+        """Распознать KCAPTCHA: сначала vision-модель (кириллица), затем ddddocr.
 
-        Локальный OCR бесплатный и быстрый, поэтому пробуем его первым. Если
-        он недоступен, несколько раз подряд не дал уверенного кода или сервер
-        отверг распознанное — подключаем vision-модель (если задан ключ).
+        Vision-модель единственная реально читает русские буквы; ddddocr видит
+        их как латиницу и годится лишь как запасной приблизительный код. Для
+        каждой картинки перебираем кандидатов по одному; после отправки кода
+        картинка устаревает (сервер рисует новую), поэтому следующий кандидат
+        проверяем уже на новой картинке.
         """
         ocr = None
         try:
@@ -590,9 +592,6 @@ class Scraper:
         if not await self._has_captcha(page):
             return True
 
-        vision_key = getattr(self.settings, "vision_api_key", "")
-        vision_allowed = self.cfg.captcha_vision_enabled and bool(vision_key)
-
         attempts = max(1, self.cfg.captcha_max_attempts)
         for attempt in range(1, attempts + 1):
             img_loc = page.locator('img[src*="captcha"], img[src*="kcaptcha"]').first
@@ -606,20 +605,7 @@ class Scraper:
             except Exception:  # noqa: BLE001
                 return False
 
-            # Для OДНОЙ картинки перебираем сначала код локального OCR, затем
-            # коды vision. Как только попытка отправлена (принята или нет),
-            # картинка устаревает — сервер при ошибке рисует новую капчу.
-            # Поэтому следующий кандидат проверяем уже на новой картинке,
-            # а не шлём коды, снятые со старой.
-            cands: list[str] = []
-            if ocr is not None:
-                ocr_code = self._local_ocr(ocr, img_bytes, attempt, attempts)
-                if ocr_code:
-                    cands.append(ocr_code)
-            if vision_allowed:
-                for cand in self._vision_ocr(img_bytes):
-                    if cand not in cands:
-                        cands.append(cand)
+            cands = self._captcha_candidates(ocr, img_bytes, attempt, attempts)
             if not cands:
                 # ничего не распознали — перерисовать капчу и пробовать снова
                 await self._reload_captcha(page)
@@ -631,7 +617,7 @@ class Scraper:
             if accepted:
                 return True
             if len(cands) > 1:
-                # сервер уже показал новую капчу — старые коды к ней не подходят
+                # сервер уже показал новую капчу — остальные коды к ней не подходят
                 log.info("Капча не принята (код «%s»); остальные варианты устарели", code)
             self._pause()
         return False
@@ -678,6 +664,27 @@ class Scraper:
         # solve_captcha_vision уже отдаёт строку только из русских строчных
         # букв (цифры и латиница преобразованы/убраны) — вариант один.
         return [code]
+
+    def _captcha_candidates(self, ocr, img_bytes: bytes, attempt: int, attempts: int) -> list[str]:
+        """Кандидаты в коды для ОДНОЙ картинки в порядке приоритета.
+
+        Сначала отвечает vision-модель (она единственная реально читает
+        кириллицу). ddddocr видит капчу как латиницу и даёт лишь грубое
+        приближение, поэтому его код идёт последним и только как запасной.
+        Числа (длину) разных кандидатов не фильтруем — пусть сервер решает.
+        """
+        vision_key = getattr(self.settings, "vision_api_key", "")
+        vision_allowed = self.cfg.captcha_vision_enabled and bool(vision_key)
+        cands: list[str] = []
+        if vision_allowed:
+            for cand in self._vision_ocr(img_bytes):
+                if cand and cand not in cands:
+                    cands.append(cand)
+        if ocr is not None:
+            ocr_code = self._local_ocr(ocr, img_bytes, attempt, attempts)
+            if ocr_code and ocr_code not in cands:
+                cands.append(ocr_code)
+        return cands
 
     async def _try_captcha_code(self, page, code: str, dump: bool) -> bool:
         """Ввести код капчи, отправить и проверить, принят ли.
